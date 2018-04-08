@@ -146,7 +146,7 @@
 #include <linux/netlink.h>
 
 /*
- *	Process Router Attention IP option (RFC 2113)
+ *	Process Router Attention IP option
  */
 int ip_call_ra_chain(struct sk_buff *skb)
 {
@@ -155,7 +155,8 @@ int ip_call_ra_chain(struct sk_buff *skb)
 	struct sock *last = NULL;
 	struct net_device *dev = skb->dev;
 
-	for (ra = rcu_dereference(ip_ra_chain); ra; ra = rcu_dereference(ra->next)) {
+	read_lock(&ip_ra_lock);
+	for (ra = ip_ra_chain; ra; ra = ra->next) {
 		struct sock *sk = ra->sk;
 
 		/* If socket is bound to an interface, only report
@@ -165,9 +166,11 @@ int ip_call_ra_chain(struct sk_buff *skb)
 		    (!sk->sk_bound_dev_if ||
 		     sk->sk_bound_dev_if == dev->ifindex) &&
 		    net_eq(sock_net(sk), dev_net(dev))) {
-			if (ip_is_fragment(ip_hdr(skb))) {
-				if (ip_defrag(skb, IP_DEFRAG_CALL_RA_CHAIN))
+			if (ip_hdr(skb)->frag_off & htons(IP_MF | IP_OFFSET)) {
+				if (ip_defrag(skb, IP_DEFRAG_CALL_RA_CHAIN)) {
+					read_unlock(&ip_ra_lock);
 					return 1;
+				}
 			}
 			if (last) {
 				struct sk_buff *skb2 = skb_clone(skb, GFP_ATOMIC);
@@ -180,31 +183,70 @@ int ip_call_ra_chain(struct sk_buff *skb)
 
 	if (last) {
 		raw_rcv(last, skb);
+		read_unlock(&ip_ra_lock);
 		return 1;
 	}
+	read_unlock(&ip_ra_lock);
 	return 0;
 }
 
+//从这里进入L4传输层
+/*
+ * ip_local_deliver_finish()将输入数据包从网络层传递
+ * 到传输层。过程如下:
+ * 1)首先，在数据包传递给传输层之前，去掉IP首部
+ * 2)接着，如果是RAW套接字接收数据包，则需要
+ * 复制一份副本，输入到接收该数据包的套接字。
+ * 3)最后，通过传输层的接收例程，将数据包传递
+ * 到传输层，由传输层进行处理。
+ */
 static int ip_local_deliver_finish(struct sk_buff *skb)
 {
 	struct net *net = dev_net(skb->dev);
 
+	/*
+	 * 在数据包传递给传输层之前，先去掉
+	 * IP首部。
+	 */
 	__skb_pull(skb, ip_hdrlen(skb));
 
 	/* Point into the IP datagram, just past the header. */
+       /* "删除"IP 首部*/
 	skb_reset_transport_header(skb);
 
 	rcu_read_lock();
-	{
+	{     /* 获取该IP包承载的上层协议,也就是传输层协议号，用于计算后面的hash*/
 		int protocol = ip_hdr(skb)->protocol;
 		int hash, raw;
 		const struct net_protocol *ipprot;
 
 	resubmit:
-		raw = raw_local_deliver(skb, protocol);
+		/*
+		 * 处理RAW套接字，先根据传输层协议号
+		 * 得到哈希值，然后查看raw_v4_htable散列表
+		 * 中以该值为关键字的哈希桶是否为空，
+		 * 如果不为空，则说明创建了RAW套接字，
+		 * 复制该数据包的副本输入到注册到
+		 * 该桶中的所有套接字。
+		 */
+/*
+ip_local_deliver_finish函数会先检查哈希表raw_v4_htable。因为在创建 socket时，inet_create会把协议号IPPROTO_ICMP的值赋给socket的成员num，
+并以num为键值，把socket存入哈 项表raw_v4_htable，raw_v4_htable[IPPROTO_ICMP&(MAX_INET_PROTOS-1)]上即存放了 这个socket，实际上是一个socket的链表，
+如果其它还有socket要处理这个回显应答，也会被放到这里，组成一个链 表，ip_local_deliver_finish收到数据报后，取出这个socket链表(目前实际上只有一项)，
+调用raw_v4_input，把 skb交给每一个socket进行处理。然后，还需要把数据报交给inet_protos[IPPROTO_ICMP& (MAX_INET_PROTOS-1)]，即icmp_rcv处理，
+因为对于icmp报文，每一个都是需要经过协议栈处理的，但对回显应 答，icmp_rcv只是简单丢弃，并未实际处理。
+*/
+		 ////之前开巨帧的时候，icmp不通就是在这里面的函数中sock_queue_rcv_skb丢的
+		raw = raw_local_deliver(skb, protocol); //如果是raw套接字，则则该函数里面会复制一份skb，然后送到，例如用ping 1.2.2.2的时候，会走这里面，不会走icmp_recv
 
 		hash = protocol & (MAX_INET_PROTOS - 1);
 		ipprot = rcu_dereference(inet_protos[hash]);
+		/*
+		 * 通过查找inet_portos数组，确定是否
+		 * 注册了与IP首部中传输层协议号
+		 * 一致的传输层协议。若查找命中，
+		 * 则执行对应的传输层协议例程。
+		 */
 		if (ipprot != NULL) {
 			int ret;
 
@@ -223,13 +265,19 @@ static int ip_local_deliver_finish(struct sk_buff *skb)
 				}
 				nf_reset(skb);
 			}
-			ret = ipprot->handler(skb);
+			ret = ipprot->handler(skb);//这里面会进入udp tcp传输层去
 			if (ret < 0) {
 				protocol = -ret;
 				goto resubmit;
 			}
 			IP_INC_STATS_BH(net, IPSTATS_MIB_INDELIVERS);
 		} else {
+			/*
+			 * 如果没有响应的协议传输层接收该数据包，
+			 * 则释放该数据包。在释放前，如果是RAW
+			 * 套接字没有接收或接收异常，则还需产生
+			 * 一个目的不可达ICMP报文给发送方。表示该包raw没有接收并且inet_protos中没有注册该协议
+			 */
 			if (!raw) {
 				if (xfrm4_policy_check(NULL, XFRM_POLICY_IN, skb)) {
 					IP_INC_STATS_BH(net, IPSTATS_MIB_INUNKNOWNPROTOS);
@@ -247,28 +295,56 @@ static int ip_local_deliver_finish(struct sk_buff *skb)
 	return 0;
 }
 
+
 /*
  * 	Deliver IP Packets to the higher protocol layers.
  */
+ /*
+  * 在ip_route_input进行路由选择后，如果接收的包
+  * 是发送给本机，则调用ip_local_deliver来传递给上层协议
+  */
+  //ip_route_input_slow->ip_local_deliver
 int ip_local_deliver(struct sk_buff *skb)
 {
-	/*
-	 *	Reassemble IP fragments.
-	 */
+    /*
+     *  Reassemble IP fragments.
+     */
+        /* 
+         * frag_off是16位，其中高3位用作标志位，
+         * 低13位才是真正的偏移量.
+         * 内核可通过设置的分片标识位或非0
+         * 的分片偏移量识别分片的分组。偏移
+         * 量字段为0，表明这是分组的最后一个分片。
+         * 
+         * 如果接收到的IP数据包时分片，则调用
+         * ip_defrag()进行重组，其标志位IP_DEFRAG_LOCAL_DELIVER。
+         */
+    if (ip_hdr(skb)->frag_off & htons(IP_MF | IP_OFFSET)) {
+       /*
+        * 重新组合分片分组的各个部分。
+        * 
+        * 如果ip_defrag()返回非0，则表示IP数据包分片
+        * 尚未到齐，重组没有完成，或者出错，直接
+        * 返回。为0，则表示已完成IP数据包的重组，
+        * 需要传递到传输层进行处理。
+        */
+        if (ip_defrag(skb, IP_DEFRAG_LOCAL_DELIVER))
+            return 0;
+    }
 
-	if (ip_is_fragment(ip_hdr(skb))) {
-		if (ip_defrag(skb, IP_DEFRAG_LOCAL_DELIVER))
-			return 0;
-	}
-
-	return NF_HOOK(NFPROTO_IPV4, NF_INET_LOCAL_IN, skb, skb->dev, NULL,
-		       ip_local_deliver_finish);
+    /*
+     * 经过netfilter处理后，调用ip_local_deliver_finish()，
+     * 将组装完成的IP数据包传送到传输层处理
+     */
+    return NF_HOOK(PF_INET, NF_INET_LOCAL_IN, skb, skb->dev, NULL,
+               ip_local_deliver_finish);
 }
+
 
 static inline int ip_rcv_options(struct sk_buff *skb)
 {
 	struct ip_options *opt;
-	const struct iphdr *iph;
+	struct iphdr *iph;
 	struct net_device *dev = skb->dev;
 
 	/* It looks as overkill, because not all
@@ -293,16 +369,18 @@ static inline int ip_rcv_options(struct sk_buff *skb)
 	}
 
 	if (unlikely(opt->srr)) {
-		struct in_device *in_dev = __in_dev_get_rcu(dev);
-
+		struct in_device *in_dev = in_dev_get(dev);
 		if (in_dev) {
 			if (!IN_DEV_SOURCE_ROUTE(in_dev)) {
 				if (IN_DEV_LOG_MARTIANS(in_dev) &&
 				    net_ratelimit())
 					printk(KERN_INFO "source route option %pI4 -> %pI4\n",
 					       &iph->saddr, &iph->daddr);
+				in_dev_put(in_dev);
 				goto drop;
 			}
+
+			in_dev_put(in_dev);
 		}
 
 		if (ip_options_rcv_srr(skb))
@@ -314,6 +392,14 @@ drop:
 	return -1;
 }
 
+/*
+ * ip_rcv_finish()在ip_rcv()中当IP数据包经过netfilter模块
+ * 处理后被调用。完成的主要功能是，如果
+ * 还没有为该数据包查找输入路由缓存，则
+ * 调用ip_route_input()为其查找输入路由缓存。
+ * 接着处理IP数据包首部中的选项，最后
+ * 根据输入路由缓存输入到本地或抓发。
+ */
 static int ip_rcv_finish(struct sk_buff *skb)
 {
 	const struct iphdr *iph = ip_hdr(skb);
@@ -323,9 +409,15 @@ static int ip_rcv_finish(struct sk_buff *skb)
 	 *	Initialise the virtual path cache for the packet. It describes
 	 *	how the packet travels inside Linux networking.
 	 */
+	/*
+	 * 如果还没有为该数据包查找输入路由缓存，
+	 * 则调用ip_route_input()为其查找输入路由缓存。
+	 * 若查找失败，则将该数据包丢弃。
+	 */
 	if (skb_dst(skb) == NULL) {
-		int err = ip_route_input_noref(skb, iph->daddr, iph->saddr,
-					       iph->tos, skb->dev);
+              /* 选择路由*/
+		int err = ip_route_input(skb, iph->daddr, iph->saddr, iph->tos,
+					 skb->dev);//最终会调用ip_local_deliver
 		if (unlikely(err)) {
 			if (err == -EHOSTUNREACH)
 				IP_INC_STATS_BH(dev_net(skb->dev),
@@ -333,16 +425,13 @@ static int ip_rcv_finish(struct sk_buff *skb)
 			else if (err == -ENETUNREACH)
 				IP_INC_STATS_BH(dev_net(skb->dev),
 						IPSTATS_MIB_INNOROUTES);
-			else if (err == -EXDEV)
-				NET_INC_STATS_BH(dev_net(skb->dev),
-						 LINUX_MIB_IPRPFILTER);
 			goto drop;
 		}
 	}
 
-#ifdef CONFIG_IP_ROUTE_CLASSID
+#ifdef CONFIG_NET_CLS_ROUTE
 	if (unlikely(skb_dst(skb)->tclassid)) {
-		struct ip_rt_acct *st = this_cpu_ptr(ip_rt_acct);
+		struct ip_rt_acct *st = per_cpu_ptr(ip_rt_acct, smp_processor_id());
 		u32 idx = skb_dst(skb)->tclassid;
 		st[idx&0xFF].o_packets++;
 		st[idx&0xFF].o_bytes += skb->len;
@@ -351,47 +440,139 @@ static int ip_rcv_finish(struct sk_buff *skb)
 	}
 #endif
 
+	/*
+	 * 根据长度判断IP首部中是否存在选项，如果有，
+	 * 则调用ip_rcv_options()处理IP选项。
+	 */
 	if (iph->ihl > 5 && ip_rcv_options(skb))
 		goto drop;
 
 	rt = skb_rtable(skb);
 	if (rt->rt_type == RTN_MULTICAST) {
-		IP_UPD_PO_STATS_BH(dev_net(rt->dst.dev), IPSTATS_MIB_INMCAST,
+		IP_UPD_PO_STATS_BH(dev_net(rt->u.dst.dev), IPSTATS_MIB_INMCAST,
 				skb->len);
 	} else if (rt->rt_type == RTN_BROADCAST)
-		IP_UPD_PO_STATS_BH(dev_net(rt->dst.dev), IPSTATS_MIB_INBCAST,
+		IP_UPD_PO_STATS_BH(dev_net(rt->u.dst.dev), IPSTATS_MIB_INBCAST,
 				skb->len);
 
-	return dst_input(skb);
+	/*
+	 * 最后根据输入路由缓存决定输入到本地或
+	 * 转发，最终前者调用ip_local_deliver()，后者调用
+	 * ip_forward()。
+	 * 对于输入到本地或转发的组播报文，在经过netfilter处理
+	 * 之后会调用ip_rcv_finish()正式进入输入的处理。先调用
+	 * ip_route_input()进行输入路由的查询，如果发现目的地址
+	 * 为组播地址，就会按照组播地址的规则查找路由，查找
+	 * 到组播的输入路由后，组播报文接收处理函数为ip_mr_input()。
+	 * 参见ip_route_input_mc().
+	 */
+	return dst_input(skb);//ip_route_input->ip_route_input_common->ip_route_input_slow中有注册  ip_local_deliver;//到本地  ip_forward转发
 
 drop:
 	kfree_skb(skb);
 	return NET_RX_DROP;
 }
 
+EXPORT_SYMBOL_GPL(ip_rcv_finish);
+
+extern int dev_d1300;
 /*
  * 	Main IP Receive routine.
+ yang add
+ 在上一节可以看到，链路层将数据包上传到IP层时，由IP层相关协议的处理例程处理。对于IP协议，这个注册的处理例程是ip_rcv()，它处理
+ 完成后交给NETFILTE（PRE-ROUTING）R过滤，再上递给ip_rcv_finish(), 这个函数根据skb包中的路由信息，决定这个数据包是转发还是上交
+ 给本机，由此产生两条路径，一为ip_local_deliver()，它首先检查这个包是否是一个分片包，如果是，它要调动ip_defrag()将分片重装，
+ 然后再次将包将给NETFILTER（LOCAL_IN）过滤后，再由ip_local_deliver_finish()将数据上传到L4层，这样就完成了IP 层的处理；它
+ 负责将数据上传，另一路径为ip_forward()，它负责将数据转发，经由NETFILTER（FORWARD）
+ 过滤后将给ip_forward_finish()，然后调用dst_output()将数据包发送出去。
+
+ http://blog.sina.com.cn/s/blog_6857a06f0100ljs4.html
+ 以下是我根据 linux-2.6.23.9版本内核源代码所做阅读笔记，属个人兴趣而为，希望找到有共同兴趣
+的朋友一起讨论和研究，有谬误之处，笔者水平有限，欢迎大家拍砖：）
+------------------------------------------------------------------------------------------
+
+|----------------------------------| 
+
+         应用层
+
+|----------------------------------|
+
+　    BSD Socket层
+
+|----------------------------------|　
+
+      Inet Socket层
+
+|----------------------------------|
+
+      IP层
+
+|----------------------------------|
+
+  数据链路/硬件层
+
+|----------------------------------|
+
+IP层：          IP协议栈的实现，完成路由的查找过程(主要处理skb)
+Inet Socket层： 对IP包进行分组排序，实现QoS,传输层协议TCP/UDP协议栈的实现
+　　　　　　    使用sock{}类型数据来管理会话，数据主要放在sk_buff结构中　　　
+BSD Socket:     对于BSD Socket相关调用的实现,主要使用socket{}结构来存放连接
+                数据主要是放在msghdr{}结构中
+
+参考:http://www.2cto.com/Article/201206/136644.html
+ ip_rcv函数。该函数主要用来处理网络层的IP报文的入口函数，它到Netfilter框架的切入点为：
+ NF_HOOK(PF_INET, NF_IP_PRE_ROUTING, skb, dev, NULL,ip_rcv_finish)
+ 根据前面的理解，这句代码意义已经很直观明确了。那就是：如果协议栈当前收到了一个IP报文(PF_INET)，那么就把这个报文传到Netfilter
+ 的NF_IP_PRE_ROUTING过滤点，去检查[R]在那个过滤点(nf_hooks[2][0])是否已经有人注册了相关的用于处理数据包的钩子函数。如果有，
+ 则挨个去遍历链表nf_hooks[2][0]去寻找匹配的match和相应的target，根据返回到Netfilter框架中的值来进一步决定该如何处理该数据包
+ (由钩子模块处理还是交由ip_rcv_finish函数继续处理)。
+ 
+ [R]：刚才说到所谓的“检查”。其核心就是nf_hook_slow()函数。该函数本质上做的事情很简单，根据优先级查找双向链表nf_hooks[][]，
+ 找到对应的回调函数来处理数据包：
+
+ 最后,数据包会传到l3层,如果是ip协议,则相应的处理函数为ip_rcv,到此数据报从网卡到l3层的接收过程已经完毕.即总的路线是: 
+ netif_rx-->net_rx_action-->process_backlog-->netif_receive_skb-- >sniffer(如果有)-->diverter(如果有)-->bridge(如果有)-->ip_rcv(或者其他的l3 层协议处理函数)
  */
+ /*
+接收数据包的下半部处理流程为：
+net_rx_action // 软中断
+    |--> process_backlog() // 默认poll
+               |--> __netif_receive_skb() // L2处理函数
+                            |--> ip_rcv() // L3入口
+
+*/
+
+/*
+ * 	Main IP Receive routine.
+ * @skb: 接收到的IP数据包
+ * @dev: 接收到的IP数据包当前的输入网络设备
+ * @pt:输入此数据包的网络层输入接口
+ * @orig_dev:接收到的IP数据包原始的输入网络设备。
+ */
+ //在data指针移动size(iphdr)后，移动到指向传输层的函数是ip_local_deliver_finish
+ //如果有发送到本地的数据包，本地收到后可能需要从组，在函数ip_local_deliver中从组
 int ip_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt, struct net_device *orig_dev)
 {
-	const struct iphdr *iph;
+	struct iphdr *iph;//定义一个ip报文的数据报头
 	u32 len;
 
-	/* When the interface is in promisc. mode, drop all the crap
-	 * that it receives, do not try to analyse it.
-	 */
-	if (skb->pkt_type == PACKET_OTHERHOST)
-		goto drop;
+	if((0 == dev_d1300) || (dev->name[3] != '2')) {
+		/* When the interface is in promisc. mode, drop all the crap
+		 * that it receives, do not try to analyse it.
+		 */
+		if (skb->pkt_type == PACKET_OTHERHOST) //数据包不是发给我们的,这里所说的“不属于”这个主机，是指在这个包目标主机的MAC地址不是本机，而不是L3层的ip地址。
+			goto drop;
+	}
 
 
-	IP_UPD_PO_STATS_BH(dev_net(dev), IPSTATS_MIB_IN, skb->len);
+	IP_UPD_PO_STATS_BH(dev_net(dev), IPSTATS_MIB_IN, skb->len); 
 
-	if ((skb = skb_share_check(skb, GFP_ATOMIC)) == NULL) {
+	if ((skb = skb_share_check(skb, GFP_ATOMIC)) == NULL) {//接下来是一个共享的检查，如果是共享的数据包，因为它可能需要修改skb中的信息，所以要先复制一个副本，再作进一步的处理。
 		IP_INC_STATS_BH(dev_net(dev), IPSTATS_MIB_INDISCARDS);
 		goto out;
 	}
 
-	if (!pskb_may_pull(skb, sizeof(struct iphdr)))
+	if (!pskb_may_pull(skb, sizeof(struct iphdr)))//再下来就是检查首部的长度是否够长，校检和等等：
 		goto inhdr_error;
 
 	iph = ip_hdr(skb);
@@ -409,8 +590,10 @@ int ip_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt, 
 
 	if (iph->ihl < 5 || iph->version != 4)
 		goto inhdr_error;
-
-	if (!pskb_may_pull(skb, iph->ihl*4))
+/*
+//iph->ihl<5说明iph->ihl指的是IP包的首部长度，首部一行是32bit也就是4byte（字节）注：1byte=8bit，byte是计算机中最小文件
+单位，普通IP数据包首部长度（不包含任何选项）字段的值是5.*/
+	if (!pskb_may_pull(skb, iph->ihl*4))//对数据报的头长度进行检查  //iph->ihl*4是20，是首部最长的长度,此语句是说如果头部长度不能pull，则error
 		goto inhdr_error;
 
 	iph = ip_hdr(skb);
@@ -429,19 +612,27 @@ int ip_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt, 
 	 * is IP we can trim to the true length of the frame.
 	 * Note this now means skb->len holds ntohs(iph->tot_len).
 	 */
-	if (pskb_trim_rcsum(skb, len)) {
+	if (pskb_trim_rcsum(skb, len)) {//根据ip包总长度，重新计算skb的长度，去掉末尾的无用信息
 		IP_INC_STATS_BH(dev_net(dev), IPSTATS_MIB_INDISCARDS);
 		goto drop;
 	}
 
 	/* Remove any debris in the socket control block */
-	memset(IPCB(skb), 0, sizeof(struct inet_skb_parm));
+	memset(IPCB(skb), 0, sizeof(struct inet_skb_parm));//这里面后面会存ip填充信息，IP如果超过20字节，就有填充信息
 
 	/* Must drop socket now because of tproxy. */
+	/*
+	 * 将skb中的IP控制块清零，以便
+	 * 后续对IP选项的处理
+	 */
 	skb_orphan(skb);
 
+    /*
+         * 最后通过netfilter模块处理后，调用ip_rcv_finish()
+         * 完成IP数据包的输入。
+         */
 	return NF_HOOK(NFPROTO_IPV4, NF_INET_PRE_ROUTING, skb, dev, NULL,
-		       ip_rcv_finish);
+		       ip_rcv_finish); //hook注册地方在nf_register_hooks
 
 inhdr_error:
 	IP_INC_STATS_BH(dev_net(dev), IPSTATS_MIB_INHDRERRORS);

@@ -8,6 +8,10 @@
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
  * published by the Free Software Foundation.
+
+
+ //http://blog.chinaunix.net/uid-127037-id-2919444.html  参考ip_queue的实现分析
+ 前面讲到，所谓IP Queue机制，只是当NF上Hook函数对数据包处理的返回值为NF_QUEUE时，协议栈会将数据包交给内核中的ip_queue模块
  */
 #include <linux/module.h>
 #include <linux/skbuff.h>
@@ -40,15 +44,24 @@
 
 typedef int (*ipq_cmpfn)(struct nf_queue_entry *, unsigned long);
 
-static unsigned char copy_mode __read_mostly = IPQ_COPY_NONE;
-static unsigned int queue_maxlen __read_mostly = IPQ_QMAX_DEFAULT;
-static DEFINE_SPINLOCK(queue_lock);
-static int peer_pid __read_mostly;
-static unsigned int copy_range __read_mostly;
+//static unsigned char copy_mode __read_mostly = IPQ_COPY_NONE;
+static unsigned char copy_mode = IPQ_COPY_NONE;
+
+//static unsigned int queue_maxlen __read_mostly = IPQ_QMAX_DEFAULT;
+static unsigned int queue_maxlen = IPQ_QMAX_DEFAULT;
+static DEFINE_RWLOCK(queue_lock);
+//static int peer_pid __read_mostly;
+static int peer_pid;//记录用户空间进程ID号
+
+//static unsigned int copy_range __read_mostly;
+static unsigned int copy_range;
 static unsigned int queue_total;
 static unsigned int queue_dropped = 0;
 static unsigned int queue_user_dropped = 0;
-static struct sock *ipqnl __read_mostly;
+
+//static struct sock *ipqnl __read_mostly;
+static struct sock *ipqnl;
+
 static LIST_HEAD(queue_list);
 static DEFINE_MUTEX(ipqnl_mutex);
 
@@ -72,10 +85,10 @@ __ipq_set_mode(unsigned char mode, unsigned int range)
 		break;
 
 	case IPQ_COPY_PACKET:
-		if (range > 0xFFFF)
-			range = 0xFFFF;
-		copy_range = range;
 		copy_mode = mode;
+		copy_range = range;
+		if (copy_range > 0xFFFF)
+			copy_range = 0xFFFF;
 		break;
 
 	default:
@@ -101,7 +114,7 @@ ipq_find_dequeue_entry(unsigned long id)
 {
 	struct nf_queue_entry *entry = NULL, *i;
 
-	spin_lock_bh(&queue_lock);
+	write_lock_bh(&queue_lock);
 
 	list_for_each_entry(i, &queue_list, list) {
 		if ((unsigned long)i == id) {
@@ -115,7 +128,7 @@ ipq_find_dequeue_entry(unsigned long id)
 		queue_total--;
 	}
 
-	spin_unlock_bh(&queue_lock);
+	write_unlock_bh(&queue_lock);
 	return entry;
 }
 
@@ -136,9 +149,9 @@ __ipq_flush(ipq_cmpfn cmpfn, unsigned long data)
 static void
 ipq_flush(ipq_cmpfn cmpfn, unsigned long data)
 {
-	spin_lock_bh(&queue_lock);
+	write_lock_bh(&queue_lock);
 	__ipq_flush(cmpfn, data);
-	spin_unlock_bh(&queue_lock);
+	write_unlock_bh(&queue_lock);
 }
 
 static struct sk_buff *
@@ -152,7 +165,9 @@ ipq_build_packet_message(struct nf_queue_entry *entry, int *errp)
 	struct nlmsghdr *nlh;
 	struct timeval tv;
 
-	switch (ACCESS_ONCE(copy_mode)) {
+	read_lock_bh(&queue_lock);
+
+	switch (copy_mode) {
 	case IPQ_COPY_META:
 	case IPQ_COPY_NONE:
 		size = NLMSG_SPACE(sizeof(*pmsg));
@@ -160,20 +175,25 @@ ipq_build_packet_message(struct nf_queue_entry *entry, int *errp)
 
 	case IPQ_COPY_PACKET:
 		if (entry->skb->ip_summed == CHECKSUM_PARTIAL &&
-		    (*errp = skb_checksum_help(entry->skb)))
+		    (*errp = skb_checksum_help(entry->skb))) {
+			read_unlock_bh(&queue_lock);
 			return NULL;
-
-		data_len = ACCESS_ONCE(copy_range);
-		if (data_len == 0 || data_len > entry->skb->len)
+		}
+		if (copy_range == 0 || copy_range > entry->skb->len)
 			data_len = entry->skb->len;
+		else
+			data_len = copy_range;
 
 		size = NLMSG_SPACE(sizeof(*pmsg) + data_len);
 		break;
 
 	default:
 		*errp = -EINVAL;
+		read_unlock_bh(&queue_lock);
 		return NULL;
 	}
+
+	read_unlock_bh(&queue_lock);
 
 	skb = alloc_skb(size, GFP_ATOMIC);
 	if (!skb)
@@ -203,8 +223,7 @@ ipq_build_packet_message(struct nf_queue_entry *entry, int *errp)
 	else
 		pmsg->outdev_name[0] = '\0';
 
-	if (entry->indev && entry->skb->dev &&
-	    entry->skb->mac_header != entry->skb->network_header) {
+	if (entry->indev && entry->skb->dev) {
 		pmsg->hw_type = entry->skb->dev->type;
 		pmsg->hw_addrlen = dev_parse_header(entry->skb,
 						    pmsg->hw_addr);
@@ -218,12 +237,12 @@ ipq_build_packet_message(struct nf_queue_entry *entry, int *errp)
 	return skb;
 
 nlmsg_failure:
-	kfree_skb(skb);
 	*errp = -EINVAL;
 	printk(KERN_ERR "ip_queue: error creating packet message\n");
 	return NULL;
 }
 
+//向用户空间发送数据
 static int
 ipq_enqueue_packet(struct nf_queue_entry *entry, unsigned int queuenum)
 {
@@ -237,7 +256,7 @@ ipq_enqueue_packet(struct nf_queue_entry *entry, unsigned int queuenum)
 	if (nskb == NULL)
 		return status;
 
-	spin_lock_bh(&queue_lock);
+	write_lock_bh(&queue_lock);
 
 	if (!peer_pid)
 		goto err_out_free_nskb;
@@ -261,14 +280,14 @@ ipq_enqueue_packet(struct nf_queue_entry *entry, unsigned int queuenum)
 
 	__ipq_enqueue_entry(entry);
 
-	spin_unlock_bh(&queue_lock);
+	write_unlock_bh(&queue_lock);
 	return status;
 
 err_out_free_nskb:
 	kfree_skb(nskb);
 
 err_out_unlock:
-	spin_unlock_bh(&queue_lock);
+	write_unlock_bh(&queue_lock);
 	return status;
 }
 
@@ -314,7 +333,7 @@ ipq_set_verdict(struct ipq_verdict_msg *vmsg, unsigned int len)
 {
 	struct nf_queue_entry *entry;
 
-	if (vmsg->value > NF_MAX_VERDICT || vmsg->value == NF_STOLEN)
+	if (vmsg->value > NF_MAX_VERDICT)
 		return -EINVAL;
 
 	entry = ipq_find_dequeue_entry(vmsg->id);
@@ -337,9 +356,9 @@ ipq_set_mode(unsigned char mode, unsigned int range)
 {
 	int status;
 
-	spin_lock_bh(&queue_lock);
+	write_lock_bh(&queue_lock);
 	status = __ipq_set_mode(mode, range);
-	spin_unlock_bh(&queue_lock);
+	write_unlock_bh(&queue_lock);
 	return status;
 }
 
@@ -359,9 +378,12 @@ ipq_receive_peer(struct ipq_peer_msg *pmsg,
 		break;
 
 	case IPQM_VERDICT:
-		status = ipq_set_verdict(&pmsg->msg.verdict,
-					 len - sizeof(*pmsg));
-		break;
+		if (pmsg->msg.verdict.value > NF_MAX_VERDICT)
+			status = -EINVAL;
+		else
+			status = ipq_set_verdict(&pmsg->msg.verdict,
+						 len - sizeof(*pmsg));
+			break;
 	default:
 		status = -EINVAL;
 	}
@@ -401,8 +423,7 @@ ipq_dev_drop(int ifindex)
 static inline void
 __ipq_rcv_skb(struct sk_buff *skb)
 {
-	int status, type, pid, flags;
-	unsigned int nlmsglen, skblen;
+	int status, type, pid, flags, nlmsglen, skblen;
 	struct nlmsghdr *nlh;
 
 	skblen = skb->len;
@@ -433,11 +454,11 @@ __ipq_rcv_skb(struct sk_buff *skb)
 	if (security_netlink_recv(skb, CAP_NET_ADMIN))
 		RCV_SKB_FAIL(-EPERM);
 
-	spin_lock_bh(&queue_lock);
+	write_lock_bh(&queue_lock);
 
 	if (peer_pid) {
 		if (peer_pid != pid) {
-			spin_unlock_bh(&queue_lock);
+			write_unlock_bh(&queue_lock);
 			RCV_SKB_FAIL(-EBUSY);
 		}
 	} else {
@@ -445,7 +466,7 @@ __ipq_rcv_skb(struct sk_buff *skb)
 		peer_pid = pid;
 	}
 
-	spin_unlock_bh(&queue_lock);
+	write_unlock_bh(&queue_lock);
 
 	status = ipq_receive_peer(NLMSG_DATA(nlh), type,
 				  nlmsglen - NLMSG_LENGTH(0));
@@ -490,10 +511,10 @@ ipq_rcv_nl_event(struct notifier_block *this,
 	struct netlink_notify *n = ptr;
 
 	if (event == NETLINK_URELEASE && n->protocol == NETLINK_FIREWALL) {
-		spin_lock_bh(&queue_lock);
+		write_lock_bh(&queue_lock);
 		if ((net_eq(n->net, &init_net)) && (n->pid == peer_pid))
 			__ipq_reset();
-		spin_unlock_bh(&queue_lock);
+		write_unlock_bh(&queue_lock);
 	}
 	return NOTIFY_DONE;
 }
@@ -520,7 +541,7 @@ static ctl_table ipq_table[] = {
 #ifdef CONFIG_PROC_FS
 static int ip_queue_show(struct seq_file *m, void *v)
 {
-	spin_lock_bh(&queue_lock);
+	read_lock_bh(&queue_lock);
 
 	seq_printf(m,
 		      "Peer PID          : %d\n"
@@ -538,7 +559,7 @@ static int ip_queue_show(struct seq_file *m, void *v)
 		      queue_dropped,
 		      queue_user_dropped);
 
-	spin_unlock_bh(&queue_lock);
+	read_unlock_bh(&queue_lock);
 	return 0;
 }
 
@@ -556,11 +577,13 @@ static const struct file_operations ip_queue_proc_fops = {
 };
 #endif
 
+//
 static const struct nf_queue_handler nfqh = {
 	.name	= "ip_queue",
 	.outfn	= &ipq_enqueue_packet,
 };
 
+//ip_queue初始化，用于从用户空间接收iptable配置及向用户空间发送数据
 static int __init ip_queue_init(void)
 {
 	int status = -ENOMEM;

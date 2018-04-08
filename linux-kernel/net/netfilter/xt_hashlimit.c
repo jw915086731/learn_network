@@ -176,7 +176,10 @@ dsthash_alloc_init(struct xt_hashlimit_htable *ht,
 		ent = NULL;
 	} else
 		ent = kmem_cache_alloc(hashlimit_cachep, GFP_ATOMIC);
-	if (ent) {
+	if (!ent) {
+		if (net_ratelimit())
+			pr_err("cannot allocate dsthash_ent\n");
+	} else {
 		memcpy(&ent->dst, dst, sizeof(ent->dst));
 		spin_lock_init(&ent->lock);
 
@@ -445,7 +448,6 @@ hashlimit_init_dst(const struct xt_hashlimit_htable *hinfo,
 {
 	__be16 _ports[2], *ports;
 	u8 nexthdr;
-	int poff;
 
 	memset(dst, 0, sizeof(*dst));
 
@@ -490,13 +492,19 @@ hashlimit_init_dst(const struct xt_hashlimit_htable *hinfo,
 		return 0;
 	}
 
-	poff = proto_ports_offset(nexthdr);
-	if (poff >= 0) {
-		ports = skb_header_pointer(skb, protoff + poff, sizeof(_ports),
+	switch (nexthdr) {
+	case IPPROTO_TCP:
+	case IPPROTO_UDP:
+	case IPPROTO_UDPLITE:
+	case IPPROTO_SCTP:
+	case IPPROTO_DCCP:
+		ports = skb_header_pointer(skb, protoff, sizeof(_ports),
 					   &_ports);
-	} else {
+		break;
+	default:
 		_ports[0] = _ports[1] = 0;
 		ports = _ports;
+		break;
 	}
 	if (!ports)
 		return -1;

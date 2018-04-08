@@ -28,8 +28,14 @@
 #include <net/netfilter/nf_conntrack_l4proto.h>
 #include <net/netfilter/nf_conntrack_core.h>
 
-static struct nf_conntrack_l4proto __rcu **nf_ct_protos[PF_MAX] __read_mostly;
-struct nf_conntrack_l3proto __rcu *nf_ct_l3protos[AF_MAX] __read_mostly;
+//static struct nf_conntrack_l4proto **nf_ct_protos[PF_MAX] __read_mostly;
+static struct nf_conntrack_l4proto **nf_ct_protos[PF_MAX]; /* 四层协议都保存在nf_ct_protos这个２维数组的全局变量中 ,
+    通过nf_conntrack_l4proto_register函数中的rcu_assign_pointer添加到该全局变量中 */
+//IPV4-TCP为nf_conntrack_l4proto_tcp4   IPV4-UDP为nf_conntrack_l4proto_udp4    IPV4-ICMP为nf_conntrack_l4proto_icmp
+
+
+///* 三层协议都保存在nf_ct_l3protos全局变量中，通过nf_conntrack_l3proto_register函数里面的rcu_assign_pointer把l3添加到了该全局数组中 */
+struct nf_conntrack_l3proto *nf_ct_l3protos[AF_MAX] __read_mostly;
 EXPORT_SYMBOL_GPL(nf_ct_l3protos);
 
 static DEFINE_MUTEX(nf_ct_proto_mutex);
@@ -61,6 +67,8 @@ nf_ct_unregister_sysctl(struct ctl_table_header **header,
 }
 #endif
 
+
+//获取加入到nf_ct_protos中的L4协议结构
 struct nf_conntrack_l4proto *
 __nf_ct_l4proto_find(u_int16_t l3proto, u_int8_t l4proto)
 {
@@ -166,7 +174,6 @@ static void nf_ct_l3proto_unregister_sysctl(struct nf_conntrack_l3proto *l3proto
 int nf_conntrack_l3proto_register(struct nf_conntrack_l3proto *proto)
 {
 	int ret = 0;
-	struct nf_conntrack_l3proto *old;
 
 	if (proto->l3proto >= AF_MAX)
 		return -EBUSY;
@@ -175,9 +182,7 @@ int nf_conntrack_l3proto_register(struct nf_conntrack_l3proto *proto)
 		return -EINVAL;
 
 	mutex_lock(&nf_ct_proto_mutex);
-	old = rcu_dereference_protected(nf_ct_l3protos[proto->l3proto],
-					lockdep_is_held(&nf_ct_proto_mutex));
-	if (old != &nf_conntrack_l3proto_generic) {
+	if (nf_ct_l3protos[proto->l3proto] != &nf_conntrack_l3proto_generic) {
 		ret = -EBUSY;
 		goto out_unlock;
 	}
@@ -204,9 +209,7 @@ void nf_conntrack_l3proto_unregister(struct nf_conntrack_l3proto *proto)
 	BUG_ON(proto->l3proto >= AF_MAX);
 
 	mutex_lock(&nf_ct_proto_mutex);
-	BUG_ON(rcu_dereference_protected(nf_ct_l3protos[proto->l3proto],
-					 lockdep_is_held(&nf_ct_proto_mutex)
-					 ) != proto);
+	BUG_ON(nf_ct_l3protos[proto->l3proto] != proto);
 	rcu_assign_pointer(nf_ct_l3protos[proto->l3proto],
 			   &nf_conntrack_l3proto_generic);
 	nf_ct_l3proto_unregister_sysctl(proto);
@@ -284,7 +287,7 @@ int nf_conntrack_l4proto_register(struct nf_conntrack_l4proto *l4proto)
 	mutex_lock(&nf_ct_proto_mutex);
 	if (!nf_ct_protos[l4proto->l3proto]) {
 		/* l3proto may be loaded latter. */
-		struct nf_conntrack_l4proto __rcu **proto_array;
+		struct nf_conntrack_l4proto **proto_array;
 		int i;
 
 		proto_array = kmalloc(MAX_NF_CT_PROTO *
@@ -296,18 +299,10 @@ int nf_conntrack_l4proto_register(struct nf_conntrack_l4proto *l4proto)
 		}
 
 		for (i = 0; i < MAX_NF_CT_PROTO; i++)
-			RCU_INIT_POINTER(proto_array[i], &nf_conntrack_l4proto_generic);
-
-		/* Before making proto_array visible to lockless readers,
-		 * we must make sure its content is committed to memory.
-		 */
-		smp_wmb();
-
+			proto_array[i] = &nf_conntrack_l4proto_generic;
 		nf_ct_protos[l4proto->l3proto] = proto_array;
-	} else if (rcu_dereference_protected(
-			nf_ct_protos[l4proto->l3proto][l4proto->l4proto],
-			lockdep_is_held(&nf_ct_proto_mutex)
-			) != &nf_conntrack_l4proto_generic) {
+	} else if (nf_ct_protos[l4proto->l3proto][l4proto->l4proto] !=
+					&nf_conntrack_l4proto_generic) {
 		ret = -EBUSY;
 		goto out_unlock;
 	}
@@ -338,10 +333,7 @@ void nf_conntrack_l4proto_unregister(struct nf_conntrack_l4proto *l4proto)
 	BUG_ON(l4proto->l3proto >= PF_MAX);
 
 	mutex_lock(&nf_ct_proto_mutex);
-	BUG_ON(rcu_dereference_protected(
-			nf_ct_protos[l4proto->l3proto][l4proto->l4proto],
-			lockdep_is_held(&nf_ct_proto_mutex)
-			) != l4proto);
+	BUG_ON(nf_ct_protos[l4proto->l3proto][l4proto->l4proto] != l4proto);
 	rcu_assign_pointer(nf_ct_protos[l4proto->l3proto][l4proto->l4proto],
 			   &nf_conntrack_l4proto_generic);
 	nf_ct_l4proto_unregister_sysctl(l4proto);
@@ -357,6 +349,7 @@ void nf_conntrack_l4proto_unregister(struct nf_conntrack_l4proto *l4proto)
 }
 EXPORT_SYMBOL_GPL(nf_conntrack_l4proto_unregister);
 
+//初始化L3和L4协议，默认为nf_conntrack_l4proto_generic      nf_conntrack_l3proto_generic
 int nf_conntrack_proto_init(void)
 {
 	unsigned int i;

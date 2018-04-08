@@ -64,28 +64,28 @@
 #define NLGRPSZ(x)	(ALIGN(x, sizeof(unsigned long) * 8) / 8)
 #define NLGRPLONGS(x)	(NLGRPSZ(x)/sizeof(unsigned long))
 
-struct netlink_sock {
+struct netlink_sock {//第一个成员就是struct sock
 	/* struct sock has to be the first member of netlink_sock */
 	struct sock		sk;
-	u32			pid;
-	u32			dst_pid;
-	u32			dst_group;
-	u32			flags;
+	u32			pid;// 自己的pid, 通常是0 
+	u32			dst_pid;// 对方的pid 
+	u32			dst_group;// 对方的组 
+	u32			flags;//如果是内核刚创建套接字netlink_kernel_create，则flags |= NETLINK_KERNEL_SOCKET
 	u32			subscriptions;
 	u32			ngroups;
 	unsigned long		*groups;
 	unsigned long		state;
-	wait_queue_head_t	wait;
+	wait_queue_head_t	wait;//等待队列wake_up_interruptible_all wake_up_interruptible进行唤醒  add_wait_queue添加  wait_event和wait_event_interruptible挂起等待 可以在af_netlink.c中搜索我wait字符串查找
 	struct netlink_callback	*cb;
 	struct mutex		*cb_mutex;
 	struct mutex		cb_def_mutex;
-	void			(*netlink_rcv)(struct sk_buff *skb);
+	void			(*netlink_rcv)(struct sk_buff *skb);//// 数据到达时  //的操作, netlink可有不同类型, 如ROUTE, FIREWALL, ARPD等, netlink_kernel_create的input函数,也就是netlink接收应用层数据的函数
 	struct module		*module;
 };
 
-struct listeners {
-	struct rcu_head		rcu;
-	unsigned long		masks[0];
+struct listeners_rcu_head {
+	struct rcu_head rcu_head;
+	void *ptr;
 };
 
 #define NETLINK_KERNEL_SOCKET	0x1
@@ -105,45 +105,53 @@ static inline int netlink_is_kernel(struct sock *sk)
 
 struct nl_pid_hash {
 	struct hlist_head *table;
-	unsigned long rehash_time;
+	unsigned long rehash_time;// 重新计算HASH的时间间隔 
 
 	unsigned int mask;
 	unsigned int shift;
 
-	unsigned int entries;
-	unsigned int max_shift;
+	unsigned int entries;// 链表节点数 
+	unsigned int max_shift; // 最大幂值 
 
-	u32 rnd;
+	u32 rnd;// 随机数 
 };
 
+//最大可有MAX_LINKS(32)个表，  头部全局变量在 static struct netlink_table *nl_table;
 struct netlink_table {
-	struct nl_pid_hash hash;
-	struct hlist_head mc_list;
-	struct listeners __rcu *listeners;
+	struct nl_pid_hash hash;// 根据pid进行HASH的netlink sock链表, 相当于客户端链表 
+	struct hlist_head mc_list;// 多播的sock链表 
+	unsigned long *listeners;//listerns是个位图对应groups中每个元素 
 	unsigned int nl_nonroot;
-	unsigned int groups;
+	unsigned int groups; // 每个netlink的协议类型可以定义多个组, 8的倍数,最小是32 
 	struct mutex *cb_mutex;
 	struct module *module;
-	int registered;
+	int registered;// 该标志表示该项被登记 
 };
 
 static struct netlink_table *nl_table;
+//这里面存的是struct nl_pid_hash *hash = &nl_table[i].hash;，i的范围0到MAX_LINKS，该结构为MAX_LINKS中的每种netlink协议类型添加一种
+//见netlink_proto_init函数，在改函数中只开辟了MAX_LINKS个指针空间大小，所以NETLINK最多可以使用32个，其中前16个已经被系统使用
 
-static DECLARE_WAIT_QUEUE_HEAD(nl_table_wait);
+//static DECLARE_WAIT_QUEUE_HEAD(nl_table_wait);
+static wait_queue_head_t nl_table_wait;
 
 static int netlink_dump(struct sock *sk);
 static void netlink_destroy_callback(struct netlink_callback *cb);
 
-static DEFINE_RWLOCK(nl_table_lock);
-static atomic_t nl_table_users = ATOMIC_INIT(0);
+//static DEFINE_RWLOCK(nl_table_lock); yang change
+struct atomic_notifier_head nl_table_lock；
 
-static ATOMIC_NOTIFIER_HEAD(netlink_chain);
+static atomic_t nl_table_users = ATOMIC_INIT(0); //没创建一个netlink netlink_create,该值加1
+
+//static ATOMIC_NOTIFIER_HEAD(netlink_chain);
+struct atomic_notifier_head netlink_chain;//
 
 static u32 netlink_group_mask(u32 group)
 {
 	return group ? 1 << (group - 1) : 0;
 }
 
+// nl_pid_hashfn根据pid查找相应HASH链表头
 static struct hlist_head *nl_pid_hashfn(struct nl_pid_hash *hash, u32 pid)
 {
 	return &hash->table[jhash_1word(pid, hash->rnd) & hash->mask];
@@ -176,7 +184,7 @@ static void netlink_sock_destruct(struct sock *sk)
  * immediately hit write lock and grab all the cpus. Exclusive sleep solves
  * this, _but_ remember, it adds useless work on UP machines.
  */
-
+//与netlink_table_ungrab配对  相当于加解锁
 void netlink_table_grab(void)
 	__acquires(nl_table_lock)
 {
@@ -202,6 +210,7 @@ void netlink_table_grab(void)
 	}
 }
 
+//和netlink_table_grab配对
 void netlink_table_ungrab(void)
 	__releases(nl_table_lock)
 {
@@ -334,16 +343,19 @@ netlink_update_listeners(struct sock *sk)
 
 	for (i = 0; i < NLGRPLONGS(tbl->groups); i++) {
 		mask = 0;
-		sk_for_each_bound(sk, node, &tbl->mc_list) {
+		sk_for_each_bound(sk, node, &tbl->mc_list) {//// 遍历多播链表生成多播组的掩码
 			if (i < NLGRPLONGS(nlk_sk(sk)->ngroups))
 				mask |= nlk_sk(sk)->groups[i];
 		}
-		tbl->listeners->masks[i] = mask;
+		tbl->listeners[i] = mask;
 	}
 	/* this function is only called with the netlink table "grabbed", which
 	 * makes sure updates are visible before bind or setsockopt return. */
 }
-
+//也就是说，pid是其中最为关键的键值，每个netlink 套接口的protocol+pid可以唯一的确定一个socket实例，这个也可以认为是一个地址
+//pid如果为0，则代表内核
+//为sock->pid赋值，并把sk添加到hash表中，该hash表通过pid做键值  应用层bind的时候该pid为应用层进程pid，内核netlink_kernel_create创建内核套接字的时候pid为0，0对应内核
+////在netlink_insert中会根据PID=0以及 unit(最大32)从而把struct sock *sk添加到nl_table[unit].hash中
 static int netlink_insert(struct sock *sk, struct net *net, u32 pid)
 {
 	struct nl_pid_hash *hash = &nl_table[sk->sk_protocol].hash;
@@ -357,7 +369,7 @@ static int netlink_insert(struct sock *sk, struct net *net, u32 pid)
 	head = nl_pid_hashfn(hash, pid);
 	len = 0;
 	sk_for_each(osk, node, head) {
-		if (net_eq(sock_net(osk), net) && (nlk_sk(osk)->pid == pid))
+		if (net_eq(sock_net(osk), net) && (nlk_sk(osk)->pid == pid))// 检查pid是否已经在链表中， 有则失败
 			break;
 		len++;
 	}
@@ -388,18 +400,22 @@ static void netlink_remove(struct sock *sk)
 {
 	netlink_table_grab();
 	if (sk_del_node_init(sk))
-		nl_table[sk->sk_protocol].hash.entries--;
+		nl_table[sk->sk_protocol].hash.entries--;  //entries在netlink_insert函数中自增
 	if (nlk_sk(sk)->subscriptions)
 		__sk_del_bind_node(sk);
 	netlink_table_ungrab();
 }
 
-static struct proto netlink_proto = {
+static struct proto netlink_proto = {//tcp 对应tcp_prot  udp对应udp_prot
 	.name	  = "NETLINK",
 	.owner	  = THIS_MODULE,
 	.obj_size = sizeof(struct netlink_sock),
 };
 
+//创建一个sturct sock
+//在__netlink_create函数中定义了netlink套接口的操作结构为netlink_ops: 
+//然后创建static struct proto netlink_proto结构空间，并初始化该结构中的成员
+//创建struct sock结构，并把struct socket与struct sock关联起来，通过sock_init_data
 static int __netlink_create(struct net *net, struct socket *sock,
 			    struct mutex *cb_mutex, int protocol)
 {
@@ -408,26 +424,34 @@ static int __netlink_create(struct net *net, struct socket *sock,
 
 	sock->ops = &netlink_ops;
 
-	sk = sk_alloc(net, PF_NETLINK, GFP_KERNEL, &netlink_proto);
+	sk = sk_alloc(net, PF_NETLINK, GFP_KERNEL, &netlink_proto);//开辟struct netlink_sock空间大小，该结构中包括struct sock，是struct sock的扩展
 	if (!sk)
 		return -ENOMEM;
 
-	sock_init_data(sock, sk);
+	sock_init_data(sock, sk);//初始化BSD socket和sock的关系
 
-	nlk = nlk_sk(sk);
+	nlk = nlk_sk(sk);//获取struct netlink_sock首地址
 	if (cb_mutex)
 		nlk->cb_mutex = cb_mutex;
 	else {
 		nlk->cb_mutex = &nlk->cb_def_mutex;
 		mutex_init(nlk->cb_mutex);
 	}
-	init_waitqueue_head(&nlk->wait);
+	init_waitqueue_head(&nlk->wait);/// 初始化等待队列 
 
 	sk->sk_destruct = netlink_sock_destruct;
 	sk->sk_protocol = protocol;
 	return 0;
 }
 
+// 在用户空间每次打开netlink socket时都会调用此函数:   //应用层创建netlink套接字的时候，会调用__sock_create，从而执行netlink_create函数
+//执行该函数的用户程序，内核需要通过sock_register函数来注册后才会调用该函数  
+//PF_NETLINK协议族套接字会调用这个函数，因为sock_register(&netlink_family_ops);注册了netlink套接字
+
+//netlink_create建立对应客户端的套接口，这个是应用程序的套接字，应用程序创建socket套接字的时候，内核会有一个对应的内核套接字，就是客户端套接口
+//netlink_kernel_create为服务器端套接口，在各种协议类型模块初始化时调用的,, 而不是socket系统调用时调用的, 每个netlink协议初始化是只调用一次(MAX_LINKS里面的每一个值最多netlink_kernel_create一次)
+
+//该函数在应用层创建套接字的时候，引起系统调用sys_socket，然后执行int __sock_create(struct net *net, int family, int type, int protocol,函数的时候会调用该函数创建应用层对应的套接字
 static int netlink_create(struct net *net, struct socket *sock, int protocol,
 			  int kern)
 {
@@ -438,7 +462,7 @@ static int netlink_create(struct net *net, struct socket *sock, int protocol,
 
 	sock->state = SS_UNCONNECTED;
 
-	if (sock->type != SOCK_RAW && sock->type != SOCK_DGRAM)
+	if (sock->type != SOCK_RAW && sock->type != SOCK_DGRAM)//应用程序创建socket套接字的时候，socket(PF_NETLINK, SOCK_RAW, NETLINK_FIREWALL)，type字段只能用SOCK_RAW或者SOCK_DGRAM
 		return -ESOCKTNOSUPPORT;
 
 	if (protocol < 0 || protocol >= MAX_LINKS)
@@ -446,7 +470,7 @@ static int netlink_create(struct net *net, struct socket *sock, int protocol,
 
 	netlink_lock_table();
 #ifdef CONFIG_MODULES
-	if (!nl_table[protocol].registered) {
+	if (!nl_table[protocol].registered) {// 如果相应的netlink协议是模块又没有加载的话先加载该模块 
 		netlink_unlock_table();
 		request_module("net-pf-%d-proto-%d", PF_NETLINK, protocol);
 		netlink_lock_table();
@@ -481,6 +505,7 @@ out_module:
 	goto out;
 }
 
+//netlink_kernel_create创建内核服务器端套接口的时候返回的就是struct socket
 static int netlink_release(struct socket *sock)
 {
 	struct sock *sk = sock->sk;
@@ -497,7 +522,6 @@ static int netlink_release(struct socket *sock)
 	 * OK. Socket is unlinked, any packets that arrive now
 	 * will be purged.
 	 */
-
 	sock->sk = NULL;
 	wake_up_interruptible_all(&nlk->wait);
 
@@ -509,6 +533,7 @@ static int netlink_release(struct socket *sock)
 						.protocol = sk->sk_protocol,
 						.pid = nlk->pid,
 					  };
+					  
 		atomic_notifier_call_chain(&netlink_chain,
 				NETLINK_URELEASE, &n);
 	}
@@ -537,6 +562,7 @@ static int netlink_release(struct socket *sock)
 	return 0;
 }
 
+//未指定pid时的自动绑定,有可能应用层bind的时候没有指定pid，这时候pid为0，我们内核创建sock的时候给其自动分配一个pid
 static int netlink_autobind(struct socket *sock)
 {
 	struct sock *sk = sock->sk;
@@ -545,7 +571,7 @@ static int netlink_autobind(struct socket *sock)
 	struct hlist_head *head;
 	struct sock *osk;
 	struct hlist_node *node;
-	s32 pid = task_tgid_vnr(current);
+	s32 pid = task_tgid_vnr(current);//    pid取为当前进程的组ID
 	int err;
 	static s32 rover = -4097;
 
@@ -553,7 +579,7 @@ retry:
 	cond_resched();
 	netlink_table_grab();
 	head = nl_pid_hashfn(hash, pid);
-	sk_for_each(osk, node, head) {
+	sk_for_each(osk, node, head) {//遍历为其分配一个没有使用的pid
 		if (!net_eq(sock_net(osk), net))
 			continue;
 		if (nlk_sk(osk)->pid == pid) {
@@ -566,7 +592,7 @@ retry:
 		}
 	}
 	netlink_table_ungrab();
-
+//    此时的pid是一个负数转换为无符号32位数， 将是一个非常大的数
 	err = netlink_insert(sk, net, pid);
 	if (err == -EADDRINUSE)
 		goto retry;
@@ -629,12 +655,14 @@ static int netlink_realloc_groups(struct sock *sk)
 	return err;
 }
 
+//参考SYSCALL_DEFINE3(bind, int, fd, struct sockaddr __user *, umyaddr, int, addrlen)的err = sock->ops->bind(sock,
+//就是通过应用层addr中的pid，然后与struct sock *sk建立关系，然后添加到nl_table[].hash对应hash中
 static int netlink_bind(struct socket *sock, struct sockaddr *addr,
 			int addr_len)
 {
 	struct sock *sk = sock->sk;
 	struct net *net = sock_net(sk);
-	struct netlink_sock *nlk = nlk_sk(sk);
+	struct netlink_sock *nlk = nlk_sk(sk);//之前sk_alloc开辟的是netlink_socket空间
 	struct sockaddr_nl *nladdr = (struct sockaddr_nl *)addr;
 	int err;
 
@@ -653,7 +681,7 @@ static int netlink_bind(struct socket *sock, struct sockaddr *addr,
 	if (nlk->pid) {
 		if (nladdr->nl_pid != nlk->pid)
 			return -EINVAL;
-	} else {
+	} else {//把pid加入nl_table[]对应hash表中
 		err = nladdr->nl_pid ?
 			netlink_insert(sk, net, nladdr->nl_pid) :
 			netlink_autobind(sock);
@@ -745,11 +773,14 @@ static void netlink_overrun(struct sock *sk)
 	atomic_inc(&sk->sk_drops);
 }
 
+//通过PID和protocol(netlink最多为32，系统用了16个)查找sock
+//根据pid和应用层sk对应的sk_protocol来找到对应的内核sock，最终执行内核sk->sk_data_ready(sk, len);，这样内核就收到数据了
 static struct sock *netlink_getsockbypid(struct sock *ssk, u32 pid)
 {
 	struct sock *sock;
 	struct netlink_sock *nlk;
 
+    //sk_protocol对应socket(PF_NETLINK, SOCK_RAW, NETLINK_KERNEL_MSG);中的NETLINK_KERNEL_MSG
 	sock = netlink_lookup(sock_net(ssk), ssk->sk_protocol, pid);
 	if (!sock)
 		return ERR_PTR(-ECONNREFUSED);
@@ -789,7 +820,7 @@ struct sock *netlink_getsockbyfilp(struct file *filp)
  * < 0: error. skb freed, reference to sock dropped.
  * 0: continue
  * 1: repeat lookup - reference dropped while waiting for socket memory.
- */
+ *///将sock和sk_buff绑定在一起，在netlink中套接字和skb的绑定与解绑定是很频繁的。 
 int netlink_attachskb(struct sock *sk, struct sk_buff *skb,
 		      long *timeo, struct sock *ssk)
 {
@@ -811,8 +842,10 @@ int netlink_attachskb(struct sock *sk, struct sk_buff *skb,
 		__set_current_state(TASK_INTERRUPTIBLE);
 		add_wait_queue(&nlk->wait, &wait);
 
+        
+        //如果此时这个sock不能接受这个sk，那么就要等待了，正好等在nlk->wait上，待到和该sock相关的进程在netlink_rcv_wake中唤醒之，说明可以过继skb了。 
 		if ((atomic_read(&sk->sk_rmem_alloc) > sk->sk_rcvbuf ||
-		     test_bit(0, &nlk->state)) &&
+		     test_bit(0, &nlk->state)) &&  //在函数netlink_rcv_wake中清零，表示没有数据在等待队列，需要等待  也就是应用层调用了接收消息的函数才可以指向该函数后续拷贝动作等
 		    !sock_flag(sk, SOCK_DEAD))
 			*timeo = schedule_timeout(*timeo);
 
@@ -830,6 +863,7 @@ int netlink_attachskb(struct sock *sk, struct sk_buff *skb,
 	return 0;
 }
 
+//内核向用户空间发送数据调用该函数，参考netlink_unicast_kernel
 int netlink_sendskb(struct sock *sk, struct sk_buff *skb)
 {
 	int len = skb->len;
@@ -871,16 +905,18 @@ static inline struct sk_buff *netlink_trim(struct sk_buff *skb,
 	return skb;
 }
 
+//在函数中检查该状态netlink_attachskb
 static inline void netlink_rcv_wake(struct sock *sk)
 {
 	struct netlink_sock *nlk = nlk_sk(sk);
 
-	if (skb_queue_empty(&sk->sk_receive_queue))
-		clear_bit(0, &nlk->state);
+	if (skb_queue_empty(&sk->sk_receive_queue))//是否接收已经完成 
+		clear_bit(0, &nlk->state);//当队列没有数据的时候，清空
 	if (!test_bit(0, &nlk->state))
-		wake_up_interruptible(&nlk->wait);
+		wake_up_interruptible(&nlk->wait);//如果清位说明接收完成，那么就唤醒等待发送的进程，这个接收进程可以继续接收了。 其实只有在溢出的情况下才会置位state 
 }
 
+//用户空间sendmsg的时候会调用该函数。用户空间向内核发送数据。内核向用户空间用netlink_sendskb
 static inline int netlink_unicast_kernel(struct sock *sk, struct sk_buff *skb)
 {
 	int ret;
@@ -890,7 +926,7 @@ static inline int netlink_unicast_kernel(struct sock *sk, struct sk_buff *skb)
 	if (nlk->netlink_rcv != NULL) {
 		ret = skb->len;
 		skb_set_owner_r(skb, sk);
-		nlk->netlink_rcv(skb);
+		nlk->netlink_rcv(skb);//在函数netlink_kernel_create中注册。
 	}
 	kfree_skb(skb);
 	sock_put(sk);
@@ -907,14 +943,14 @@ int netlink_unicast(struct sock *ssk, struct sk_buff *skb,
 	skb = netlink_trim(skb, gfp_any());
 
 	timeo = sock_sndtimeo(ssk, nonblock);
-retry:
-	sk = netlink_getsockbypid(ssk, pid);
+retry://netlink_unicast的参数dst_pid为确定目标sock提供了方向
+	sk = netlink_getsockbypid(ssk, pid);//用户空间sendmsg的时候，填写的PID为0，也就是获取内核端创建的sock
 	if (IS_ERR(sk)) {
 		kfree_skb(skb);
 		return PTR_ERR(sk);
 	}
-	if (netlink_is_kernel(sk))
-		return netlink_unicast_kernel(sk, skb);
+	if (netlink_is_kernel(sk)) 
+		return netlink_unicast_kernel(sk, skb); //这里应该是内核向应用层发送数据的时候
 
 	if (sk_filter(sk, skb)) {
 		err = skb->len;
@@ -929,14 +965,14 @@ retry:
 	if (err)
 		return err;
 
-	return netlink_sendskb(sk, skb);
+	return netlink_sendskb(sk, skb);//在套接字sk上传输这个skb，其实就是将这个skb排入了该sk的接收队列的后头。 
 }
 EXPORT_SYMBOL(netlink_unicast);
 
 int netlink_has_listeners(struct sock *sk, unsigned int group)
 {
 	int res = 0;
-	struct listeners *listeners;
+	unsigned long *listeners;
 
 	BUG_ON(!netlink_is_kernel(sk));
 
@@ -944,7 +980,7 @@ int netlink_has_listeners(struct sock *sk, unsigned int group)
 	listeners = rcu_dereference(nl_table[sk->sk_protocol].listeners);
 
 	if (group - 1 < nl_table[sk->sk_protocol].groups)
-		res = test_bit(group - 1, listeners->masks);
+		res = test_bit(group - 1, listeners);
 
 	rcu_read_unlock();
 
@@ -982,6 +1018,7 @@ struct netlink_broadcast_data {
 	void *tx_data;
 };
 
+//发送数据到sock
 static inline int do_one_broadcast(struct sock *sk,
 				   struct netlink_broadcast_data *p)
 {
@@ -1028,7 +1065,7 @@ static inline int do_one_broadcast(struct sock *sk,
 	} else if (sk_filter(sk, p->skb2)) {
 		kfree_skb(p->skb2);
 		p->skb2 = NULL;
-	} else if ((val = netlink_broadcast_deliver(sk, p->skb2)) < 0) {
+	} else if ((val = netlink_broadcast_deliver(sk, p->skb2)) < 0) {//发送到对应到对应sock
 		netlink_overrun(sk);
 		if (nlk->flags & NETLINK_BROADCAST_SEND_ERROR)
 			p->delivery_failure = 1;
@@ -1076,15 +1113,14 @@ int netlink_broadcast_filtered(struct sock *ssk, struct sk_buff *skb, u32 pid,
 	sk_for_each_bound(sk, node, &nl_table[ssk->sk_protocol].mc_list)
 		do_one_broadcast(sk, &info);
 
-	consume_skb(skb);
+	kfree_skb(skb);
 
 	netlink_unlock_table();
 
-	if (info.delivery_failure) {
-		kfree_skb(info.skb2);
+	kfree_skb(info.skb2);
+
+	if (info.delivery_failure)
 		return -ENOBUFS;
-	} else
-		consume_skb(info.skb2);
 
 	if (info.delivered) {
 		if (info.congested && (allocation & __GFP_WAIT))
@@ -1300,6 +1336,7 @@ static int netlink_getsockopt(struct socket *sock, int level, int optname,
 	return err;
 }
 
+//填充struct msghdr，然后拷贝struct msghdr头部和data数据部分到用户空间
 static void netlink_cmsg_recv_pktinfo(struct msghdr *msg, struct sk_buff *skb)
 {
 	struct nl_pktinfo info;
@@ -1324,22 +1361,22 @@ static int netlink_sendmsg(struct kiocb *kiocb, struct socket *sock,
 	if (msg->msg_flags&MSG_OOB)
 		return -EOPNOTSUPP;
 
-	if (NULL == siocb->scm)
+	if (NULL == siocb->scm) {
 		siocb->scm = &scm;
+		memset(&scm, 0, sizeof(scm));
+	}
 
 	err = scm_send(sock, msg, siocb->scm);
 	if (err < 0)
 		return err;
 
 	if (msg->msg_namelen) {
-		err = -EINVAL;
 		if (addr->nl_family != AF_NETLINK)
-			goto out;
+			return -EINVAL;
 		dst_pid = addr->nl_pid;
 		dst_group = ffs(addr->nl_groups);
-		err =  -EPERM;
 		if (dst_group && !netlink_capable(sock, NL_NONROOT_SEND))
-			goto out;
+			return -EPERM;
 	} else {
 		dst_pid = nlk->dst_pid;
 		dst_group = nlk->dst_group;
@@ -1355,16 +1392,25 @@ static int netlink_sendmsg(struct kiocb *kiocb, struct socket *sock,
 	if (len > sk->sk_sndbuf - 32)
 		goto out;
 	err = -ENOBUFS;
-	skb = alloc_skb(len, GFP_KERNEL);
+	skb = alloc_skb(len, GFP_KERNEL);//开辟一个SKB
 	if (skb == NULL)
 		goto out;
 
 	NETLINK_CB(skb).pid	= nlk->pid;
 	NETLINK_CB(skb).dst_group = dst_group;
+	NETLINK_CB(skb).loginuid = audit_get_loginuid(current);
+	NETLINK_CB(skb).sessionid = audit_get_sessionid(current);
+	security_task_getsecid(current, &(NETLINK_CB(skb).sid));
 	memcpy(NETLINK_CREDS(skb), &siocb->scm->creds, sizeof(struct ucred));
 
+	/* What can I do? Netlink is asynchronous, so that
+	   we will have to save current capabilities to
+	   check them, when this message will be delivered
+	   to corresponding kernel module.   --ANK (980802)
+	 */
+
 	err = -EFAULT;
-	if (memcpy_fromiovec(skb_put(skb, len), msg->msg_iov, len)) {
+	if (memcpy_fromiovec(skb_put(skb, len), msg->msg_iov, len)) {// 将发送的信息拷贝到skb的存储区
 		kfree_skb(skb);
 		goto out;
 	}
@@ -1382,10 +1428,10 @@ static int netlink_sendmsg(struct kiocb *kiocb, struct socket *sock,
 	err = netlink_unicast(sk, skb, dst_pid, msg->msg_flags&MSG_DONTWAIT);
 
 out:
-	scm_destroy(siocb->scm);
 	return err;
 }
 
+//数据是内核传向用户空间的
 static int netlink_recvmsg(struct kiocb *kiocb, struct socket *sock,
 			   struct msghdr *msg, size_t len,
 			   int flags)
@@ -1397,14 +1443,14 @@ static int netlink_recvmsg(struct kiocb *kiocb, struct socket *sock,
 	int noblock = flags&MSG_DONTWAIT;
 	size_t copied;
 	struct sk_buff *skb, *data_skb;
-	int err, ret;
+	int err;
 
 	if (flags&MSG_OOB)
 		return -EOPNOTSUPP;
 
 	copied = 0;
 
-	skb = skb_recv_datagram(sk, flags, noblock, &err);
+	skb = skb_recv_datagram(sk, flags, noblock, &err);//从队列sk_receive_queue中取出一个数据
 	if (skb == NULL)
 		goto out;
 
@@ -1430,13 +1476,13 @@ static int netlink_recvmsg(struct kiocb *kiocb, struct socket *sock,
 	msg->msg_namelen = 0;
 
 	copied = data_skb->len;
-	if (len < copied) {
+	if (len < copied) {//  //如果用户需要的长度小于数据报的长度，则丢弃剩余的数据包
 		msg->msg_flags |= MSG_TRUNC;
 		copied = len;
 	}
 
 	skb_reset_transport_header(data_skb);
-	err = skb_copy_datagram_iovec(data_skb, 0, msg->msg_iov, copied);
+	err = skb_copy_datagram_iovec(data_skb, 0, msg->msg_iov, copied);//将skb拷贝至msghdr的iovec中
 
 	if (msg->msg_name) {
 		struct sockaddr_nl *addr = (struct sockaddr_nl *)msg->msg_name;
@@ -1447,7 +1493,7 @@ static int netlink_recvmsg(struct kiocb *kiocb, struct socket *sock,
 		msg->msg_namelen = sizeof(*addr);
 	}
 
-	if (nlk->flags & NETLINK_RECV_PKTINFO)
+	if (nlk->flags & NETLINK_RECV_PKTINFO)//把netlink消息头(struct msghdr)和数据拷贝到用户空间
 		netlink_cmsg_recv_pktinfo(msg, skb);
 
 	if (NULL == siocb->scm) {
@@ -1460,13 +1506,8 @@ static int netlink_recvmsg(struct kiocb *kiocb, struct socket *sock,
 
 	skb_free_datagram(sk, skb);
 
-	if (nlk->cb && atomic_read(&sk->sk_rmem_alloc) <= sk->sk_rcvbuf / 2) {
-		ret = netlink_dump(sk);
-		if (ret) {
-			sk->sk_err = ret;
-			sk->sk_error_report(sk);
-		}
-	}
+	if (nlk->cb && atomic_read(&sk->sk_rmem_alloc) <= sk->sk_rcvbuf / 2)
+		netlink_dump(sk);
 
 	scm_recv(sock, msg, siocb->scm, flags);
 out:
@@ -1474,6 +1515,16 @@ out:
 	return err ? : copied;
 }
 
+
+/*
+static void netlink_data_ready(struct sock *sk, int len)
+{
+         struct netlink_opt *nlk = nlk_sk(sk);
+         if (nlk->data_ready)
+                 nlk->data_ready(sk, len);  //这里调用的回调函数就是内核netlink套接字建立的时候传入的那个函数。
+         netlink_rcv_wake(sk);    //告知别的进程该sock上刚完成了一次接收，可能会腾出地方以便接收新的skb
+} 
+*/ //这里为什么和http://blog.csdn.net/dog250/article/details/5303430中的不一样          ?????????????????????????????????
 static void netlink_data_ready(struct sock *sk, int len)
 {
 	BUG();
@@ -1484,22 +1535,26 @@ static void netlink_data_ready(struct sock *sk, int len)
  *	complete set of kernel non-blocking support for message
  *	queueing.
  */
-
-struct sock *
-netlink_kernel_create(struct net *net, int unit, unsigned int groups,
+ 
+//netlink_create建立对应客户端的套接口，这个是应用程序的套接字，应用程序创建socket套接字的时候，内核会有一个对应的内核套接字，就是客户端套接口
+//netlink_kernel_create为服务器端套接口，在各种协议类型模块初始化时调用的,, 而不是socket系统调用时调用的, 每个netlink协议初始化是只调用一次(MAX_LINKS里面的每一个值最多netlink_kernel_create一次)
+//unit取值范围为netlink协议范围 0 - MAX_LINKS，input为netlink接收应用层数据函数，当有数据来的时候调用input函数
+//在netlink_insert中会根据PID=0以及 unit(最大32)从而把struct sock *sk添加到nl_table[unit].hash中
+struct sock *netlink_kernel_create(struct net *net, int unit, unsigned int groups,
 		      void (*input)(struct sk_buff *skb),
 		      struct mutex *cb_mutex, struct module *module)
 {
 	struct socket *sock;
 	struct sock *sk;
 	struct netlink_sock *nlk;
-	struct listeners *listeners = NULL;
+	unsigned long *listeners = NULL;
 
 	BUG_ON(!nl_table);
 
 	if (unit < 0 || unit >= MAX_LINKS)
 		return NULL;
 
+    ////该函数的前三个参数和应用层的int socket(int domain, int type, int protocol);函数参数一致，并且domain和protocol值要一致
 	if (sock_create_lite(PF_NETLINK, SOCK_DGRAM, unit, &sock))
 		return NULL;
 
@@ -1512,13 +1567,14 @@ netlink_kernel_create(struct net *net, int unit, unsigned int groups,
 	if (__netlink_create(&init_net, sock, cb_mutex, unit) < 0)
 		goto out_sock_release_nosk;
 
-	sk = sock->sk;
+	sk = sock->sk;//即为上面__netlink_create创建的struct sock
 	sk_change_net(sk, net);
 
 	if (groups < 32)
 		groups = 32;
 
-	listeners = kzalloc(sizeof(*listeners) + NLGRPSZ(groups), GFP_KERNEL);
+	listeners = kzalloc(NLGRPSZ(groups) + sizeof(struct listeners_rcu_head),
+			    GFP_KERNEL);
 	if (!listeners)
 		goto out_sock_release;
 
@@ -1535,7 +1591,7 @@ netlink_kernel_create(struct net *net, int unit, unsigned int groups,
 	netlink_table_grab();
 	if (!nl_table[unit].registered) {
 		nl_table[unit].groups = groups;
-		rcu_assign_pointer(nl_table[unit].listeners, listeners);
+		nl_table[unit].listeners = listeners;
 		nl_table[unit].cb_mutex = cb_mutex;
 		nl_table[unit].module = module;
 		nl_table[unit].registered = 1;
@@ -1565,23 +1621,44 @@ netlink_kernel_release(struct sock *sk)
 }
 EXPORT_SYMBOL(netlink_kernel_release);
 
+
+static void netlink_free_old_listeners(struct rcu_head *rcu_head)
+{
+	struct listeners_rcu_head *lrh;
+
+	lrh = container_of(rcu_head, struct listeners_rcu_head, rcu_head);
+	kfree(lrh->ptr);
+}
+
 int __netlink_change_ngroups(struct sock *sk, unsigned int groups)
 {
-	struct listeners *new, *old;
+	unsigned long *listeners, *old = NULL;
+	struct listeners_rcu_head *old_rcu_head;
 	struct netlink_table *tbl = &nl_table[sk->sk_protocol];
 
 	if (groups < 32)
 		groups = 32;
 
 	if (NLGRPSZ(tbl->groups) < NLGRPSZ(groups)) {
-		new = kzalloc(sizeof(*new) + NLGRPSZ(groups), GFP_ATOMIC);
-		if (!new)
+		listeners = kzalloc(NLGRPSZ(groups) +
+				    sizeof(struct listeners_rcu_head),
+				    GFP_ATOMIC);
+		if (!listeners)
 			return -ENOMEM;
-		old = rcu_dereference_protected(tbl->listeners, 1);
-		memcpy(new->masks, old->masks, NLGRPSZ(tbl->groups));
-		rcu_assign_pointer(tbl->listeners, new);
-
-		kfree_rcu(old, rcu);
+		old = tbl->listeners;
+		memcpy(listeners, old, NLGRPSZ(tbl->groups));
+		rcu_assign_pointer(tbl->listeners, listeners);
+		/*
+		 * Free the old memory after an RCU grace period so we
+		 * don't leak it. We use call_rcu() here in order to be
+		 * able to call this function from atomic contexts. The
+		 * allocation of this memory will have reserved enough
+		 * space for struct listeners_rcu_head at the end.
+		 */
+		old_rcu_head = (void *)(tbl->listeners +
+					NLGRPLONGS(tbl->groups));
+		old_rcu_head->ptr = old;
+		call_rcu(&old_rcu_head->rcu_head, netlink_free_old_listeners);
 	}
 	tbl->groups = groups;
 
@@ -1658,10 +1735,13 @@ static int netlink_dump(struct sock *sk)
 {
 	struct netlink_sock *nlk = nlk_sk(sk);
 	struct netlink_callback *cb;
-	struct sk_buff *skb = NULL;
+	struct sk_buff *skb;
 	struct nlmsghdr *nlh;
 	int len, err = -ENOBUFS;
-	int alloc_size;
+
+	skb = sock_rmalloc(sk, NLMSG_GOODSIZE, 0, GFP_KERNEL);
+	if (!skb)
+		goto errout;
 
 	mutex_lock(nlk->cb_mutex);
 
@@ -1670,12 +1750,6 @@ static int netlink_dump(struct sock *sk)
 		err = -EINVAL;
 		goto errout_skb;
 	}
-
-	alloc_size = max_t(int, cb->min_dump_alloc, NLMSG_GOODSIZE);
-
-	skb = sock_rmalloc(sk, alloc_size, 0, GFP_KERNEL);
-	if (!skb)
-		goto errout_skb;
 
 	len = cb->dump(skb, cb);
 
@@ -1694,8 +1768,6 @@ static int netlink_dump(struct sock *sk)
 	nlh = nlmsg_put_answer(skb, cb, NLMSG_DONE, sizeof(len), NLM_F_MULTI);
 	if (!nlh)
 		goto errout_skb;
-
-	nl_dump_check_consistent(cb, nlh);
 
 	memcpy(nlmsg_data(nlh), &len, sizeof(len));
 
@@ -1717,6 +1789,7 @@ static int netlink_dump(struct sock *sk)
 errout_skb:
 	mutex_unlock(nlk->cb_mutex);
 	kfree_skb(skb);
+errout:
 	return err;
 }
 
@@ -1724,13 +1797,11 @@ int netlink_dump_start(struct sock *ssk, struct sk_buff *skb,
 		       const struct nlmsghdr *nlh,
 		       int (*dump)(struct sk_buff *skb,
 				   struct netlink_callback *),
-		       int (*done)(struct netlink_callback *),
-		       u16 min_dump_alloc)
+		       int (*done)(struct netlink_callback *))
 {
 	struct netlink_callback *cb;
 	struct sock *sk;
 	struct netlink_sock *nlk;
-	int ret;
 
 	cb = kzalloc(sizeof(*cb), GFP_KERNEL);
 	if (cb == NULL)
@@ -1739,7 +1810,6 @@ int netlink_dump_start(struct sock *ssk, struct sk_buff *skb,
 	cb->dump = dump;
 	cb->done = done;
 	cb->nlh = nlh;
-	cb->min_dump_alloc = min_dump_alloc;
 	atomic_inc(&skb->users);
 	cb->skb = skb;
 
@@ -1760,12 +1830,8 @@ int netlink_dump_start(struct sock *ssk, struct sk_buff *skb,
 	nlk->cb = cb;
 	mutex_unlock(nlk->cb_mutex);
 
-	ret = netlink_dump(sk);
-
+	netlink_dump(sk);
 	sock_put(sk);
-
-	if (ret)
-		return ret;
 
 	/* We successfully started a dump, by returning -EINTR we
 	 * signal not to send ACK even if it was requested.
@@ -1990,7 +2056,7 @@ static int netlink_seq_show(struct seq_file *seq, void *v)
 		struct sock *s = v;
 		struct netlink_sock *nlk = nlk_sk(s);
 
-		seq_printf(seq, "%pK %-3d %-6d %08x %-8d %-8d %pK %-8d %-8d %-8lu\n",
+		seq_printf(seq, "%p %-3d %-6d %08x %-8d %-8d %p %-8d %-8d %-8lu\n",
 			   s,
 			   s->sk_protocol,
 			   nlk->pid,
@@ -2031,6 +2097,7 @@ static const struct file_operations netlink_seq_fops = {
 
 #endif
 
+//添加nb事件到netlink_chain链中
 int netlink_register_notifier(struct notifier_block *nb)
 {
 	return atomic_notifier_chain_register(&netlink_chain, nb);
@@ -2043,28 +2110,35 @@ int netlink_unregister_notifier(struct notifier_block *nb)
 }
 EXPORT_SYMBOL(netlink_unregister_notifier);
 
+//用户空间和内核空间能够通信的关键见函数netlink_getsockbypid
 static const struct proto_ops netlink_ops = {
 	.family =	PF_NETLINK,
 	.owner =	THIS_MODULE,
 	.release =	netlink_release,
 	.bind =		netlink_bind,
 	.connect =	netlink_connect,
-	.socketpair =	sock_no_socketpair,
-	.accept =	sock_no_accept,
+	.socketpair =	sock_no_socketpair, // 无定义 
+	.accept =	sock_no_accept, // 无定义 
 	.getname =	netlink_getname,
 	.poll =		datagram_poll,
-	.ioctl =	sock_no_ioctl,
-	.listen =	sock_no_listen,
-	.shutdown =	sock_no_shutdown,
+	.ioctl =	sock_no_ioctl, // 无定义 
+	.listen =	sock_no_listen, // 无定义 
+	.shutdown =	sock_no_shutdown, // 无定义 
 	.setsockopt =	netlink_setsockopt,
 	.getsockopt =	netlink_getsockopt,
 	.sendmsg =	netlink_sendmsg,
 	.recvmsg =	netlink_recvmsg,
-	.mmap =		sock_no_mmap,
-	.sendpage =	sock_no_sendpage,
+	.mmap =		sock_no_mmap, // 无定义 
+	.sendpage =	sock_no_sendpage, // 无定义 
 };
 
-static const struct net_proto_family netlink_family_ops = {
+/*
+// netlink协议族操作, 在用户程序使用socket打开netlink类型的socket时调用, 
+// 相应的create函数在__sock_create(net/socket.c)函数中调用: 
+*/
+////pf_inet的net_families[]为inet_family_ops，对应的套接口层ops参考inetsw_array中的inet_stream_ops inet_dgram_ops inet_sockraw_ops，传输层操作集分别为tcp_prot udp_prot raw_prot
+//netlink的net_families[]netlink_family_ops，对应的套接口层ops为netlink_ops
+static const struct net_proto_family netlink_family_ops = { //PF_INET对应inet_family_ops  对应操作集netlink_ops
 	.family = PF_NETLINK,
 	.create = netlink_create,
 	.owner	= THIS_MODULE,	/* for consistency 8) */
@@ -2086,25 +2160,6 @@ static void __net_exit netlink_net_exit(struct net *net)
 #endif
 }
 
-static void __init netlink_add_usersock_entry(void)
-{
-	struct listeners *listeners;
-	int groups = 32;
-
-	listeners = kzalloc(sizeof(*listeners) + NLGRPSZ(groups), GFP_KERNEL);
-	if (!listeners)
-		panic("netlink_add_usersock_entry: Cannot allocate listeners\n");
-
-	netlink_table_grab();
-
-	nl_table[NETLINK_USERSOCK].groups = groups;
-	rcu_assign_pointer(nl_table[NETLINK_USERSOCK].listeners, listeners);
-	nl_table[NETLINK_USERSOCK].module = THIS_MODULE;
-	nl_table[NETLINK_USERSOCK].registered = 1;
-
-	netlink_table_ungrab();
-}
-
 static struct pernet_operations __net_initdata netlink_net_ops = {
 	.init = netlink_net_init,
 	.exit = netlink_net_exit,
@@ -2123,7 +2178,7 @@ static int __init netlink_proto_init(void)
 
 	BUILD_BUG_ON(sizeof(struct netlink_skb_parms) > sizeof(dummy_skb->cb));
 
-	nl_table = kcalloc(MAX_LINKS, sizeof(*nl_table), GFP_KERNEL);
+	nl_table = kcalloc(MAX_LINKS, sizeof(*nl_table), GFP_KERNEL);//之开辟了MAX_LINKS个na_talbe指针空间
 	if (!nl_table)
 		goto panic;
 
@@ -2136,7 +2191,7 @@ static int __init netlink_proto_init(void)
 	limit = (1UL << order) / sizeof(struct hlist_head);
 	order = get_bitmask_order(min(limit, (unsigned long)UINT_MAX)) - 1;
 
-	for (i = 0; i < MAX_LINKS; i++) {
+	for (i = 0; i < MAX_LINKS; i++) {//分配MAX_LINKS个netlink表结构, nl_table, 每个成员代表一种协议类型
 		struct nl_pid_hash *hash = &nl_table[i].hash;
 
 		hash->table = nl_pid_hash_zalloc(1 * sizeof(*hash->table));
@@ -2152,8 +2207,6 @@ static int __init netlink_proto_init(void)
 		hash->mask = 0;
 		hash->rehash_time = jiffies;
 	}
-
-	netlink_add_usersock_entry();
 
 	sock_register(&netlink_family_ops);
 	register_pernet_subsys(&netlink_net_ops);

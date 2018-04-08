@@ -27,7 +27,8 @@
 
 static DEFINE_MUTEX(afinfo_mutex);
 
-const struct nf_afinfo __rcu *nf_afinfo[NFPROTO_NUMPROTO] __read_mostly;
+//const struct nf_afinfo *nf_afinfo[NFPROTO_NUMPROTO] __read_mostly;
+const struct nf_afinfo *nf_afinfo[NFPROTO_NUMPROTO]; //目前被nf_queue功能使用，通过nf_register_afinfo注册 IPV4见nf_ip_afinfo
 EXPORT_SYMBOL(nf_afinfo);
 
 int nf_register_afinfo(const struct nf_afinfo *afinfo)
@@ -37,7 +38,7 @@ int nf_register_afinfo(const struct nf_afinfo *afinfo)
 	err = mutex_lock_interruptible(&afinfo_mutex);
 	if (err < 0)
 		return err;
-	RCU_INIT_POINTER(nf_afinfo[afinfo->family], afinfo);
+	rcu_assign_pointer(nf_afinfo[afinfo->family], afinfo);
 	mutex_unlock(&afinfo_mutex);
 	return 0;
 }
@@ -46,12 +47,24 @@ EXPORT_SYMBOL_GPL(nf_register_afinfo);
 void nf_unregister_afinfo(const struct nf_afinfo *afinfo)
 {
 	mutex_lock(&afinfo_mutex);
-	RCU_INIT_POINTER(nf_afinfo[afinfo->family], NULL);
+	rcu_assign_pointer(nf_afinfo[afinfo->family], NULL);
 	mutex_unlock(&afinfo_mutex);
 	synchronize_rcu();
 }
 EXPORT_SYMBOL_GPL(nf_unregister_afinfo);
 
+/*
+这是一个三维的实现模型，第一维可以认为是不同的网络协议簇，第二维是协议簇中事件(对应一些检测位置)，第三维就是这个链表中可以挂载的
+所有检测函数，数组nf_hooks的每个元素只是一个链表头位置，它下面可以挂接任意多的检测函数，从而形成一个动态挂载任意多的检测。
+该数组中的每一个队列中挂接的是一个struct nf_hook_ops
+
+struct list_head nf_hooks[NFPROTO_NUMPROTO][NF_MAX_HOOKS]是其中核心的数据结构。nf_hooks的功能类似一个二维的函数指针数组。
+nf_hooks数组的第一维是按照协议进行分类的，对于不同的协议有不同的hook点和hook函数，常见的协议包括ipv4，ipv6，arp，bridge等。
+nf_hooks数组的第二维是按照hook点进行划分的，分为
+NF_INET_PRE_ROUTING，NF_INET_LOCAL_IN，NF_INET_FORWARD，NF_INET_LOCAL_OUT，NF_INET_POST_ROUTING等5个hook点，与iptables的5个链相对应。
+nf_hooks数组中的每一个元素可以理解为一个函数指针链表的链表头。这个函数指针链表是一个有序链表，按照函数hook的优先级进行排序
+参考地址:http://www.360doc.com/content/13/0914/12/3884271_314370861.shtml
+*/
 struct list_head nf_hooks[NFPROTO_NUMPROTO][NF_MAX_HOOKS] __read_mostly;
 EXPORT_SYMBOL(nf_hooks);
 static DEFINE_MUTEX(nf_hook_mutex);
@@ -68,7 +81,7 @@ int nf_register_hook(struct nf_hook_ops *reg)
 		if (reg->priority < elem->priority)
 			break;
 	}
-	list_add_rcu(&reg->list, elem->list.prev);
+	list_add_rcu(&reg->list, elem->list.prev); //yang add 把reg按照优先级加入链表中去
 	mutex_unlock(&nf_hook_mutex);
 	return 0;
 }
@@ -84,6 +97,7 @@ void nf_unregister_hook(struct nf_hook_ops *reg)
 }
 EXPORT_SYMBOL(nf_unregister_hook);
 
+//yang add 按照[reg->pf][reg->hooknum]加入到nf_hooks对应的链表中去
 int nf_register_hooks(struct nf_hook_ops *reg, unsigned int n)
 {
 	unsigned int i;
@@ -105,11 +119,14 @@ EXPORT_SYMBOL(nf_register_hooks);
 
 void nf_unregister_hooks(struct nf_hook_ops *reg, unsigned int n)
 {
-	while (n-- > 0)
-		nf_unregister_hook(&reg[n]);
+	unsigned int i;
+
+	for (i = 0; i < n; i++)
+		nf_unregister_hook(&reg[i]);
 }
 EXPORT_SYMBOL(nf_unregister_hooks);
 
+//遍历hook函数，//如果执行hook函数返回值不是ACCPT活着REPEAT的时候，则从hook链表中直接返回不会在继续执行next hook函数，参考nf_hook_slow
 unsigned int nf_iterate(struct list_head *head,
 			struct sk_buff *skb,
 			unsigned int hook,
@@ -125,7 +142,7 @@ unsigned int nf_iterate(struct list_head *head,
 	 * The caller must not block between calls to this
 	 * function because of risk of continuing from deleted element.
 	 */
-	list_for_each_continue_rcu(*i, head) {
+	list_for_each_continue_rcu(*i, head) {//遍历i链表
 		struct nf_hook_ops *elem = (struct nf_hook_ops *)*i;
 
 		if (hook_thresh > elem->priority)
@@ -133,9 +150,8 @@ unsigned int nf_iterate(struct list_head *head,
 
 		/* Optimization: we don't need to hold module
 		   reference here, since function can't sleep. --RR */
-repeat:
 		verdict = elem->hook(hook, skb, indev, outdev, okfn);
-		if (verdict != NF_ACCEPT) {
+		if (verdict != NF_ACCEPT) {//如果当前hook函数的返回值为ACCEPT,则继续下一个hook继续  hook函数在函数nf_register_hooks中注册
 #ifdef CONFIG_NETFILTER_DEBUG
 			if (unlikely((verdict & NF_VERDICT_MASK)
 							> NF_MAX_VERDICT)) {
@@ -146,7 +162,7 @@ repeat:
 #endif
 			if (verdict != NF_REPEAT)
 				return verdict;
-			goto repeat;
+			*i = (*i)->prev;//如果verdict值为NF_REPEAT则继续执行该HOOK函数，这里注意，可能会出现死循环
 		}
 	}
 	return NF_ACCEPT;
@@ -154,7 +170,9 @@ repeat:
 
 
 /* Returns 1 if okfn() needs to be executed by the caller,
- * -EPERM for NF_DROP, 0 otherwise. */
+ * -EPERM for NF_DROP, 0 otherwise. 
+ nf_hook_slow去完成钩子函数okfn的顺序遍历(优先级从小到大依次执行)。
+ */
 int nf_hook_slow(u_int8_t pf, unsigned int hook, struct sk_buff *skb,
 		 struct net_device *indev,
 		 struct net_device *outdev,
@@ -174,22 +192,13 @@ next_hook:
 			     outdev, &elem, okfn, hook_thresh);
 	if (verdict == NF_ACCEPT || verdict == NF_STOP) {
 		ret = 1;
-	} else if ((verdict & NF_VERDICT_MASK) == NF_DROP) {
+	} else if (verdict == NF_DROP) {
 		kfree_skb(skb);
-		ret = NF_DROP_GETERR(verdict);
-		if (ret == 0)
-			ret = -EPERM;
+		ret = -EPERM;
 	} else if ((verdict & NF_VERDICT_MASK) == NF_QUEUE) {
-		int err = nf_queue(skb, elem, pf, hook, indev, outdev, okfn,
-						verdict >> NF_VERDICT_QBITS);
-		if (err < 0) {
-			if (err == -ECANCELED)
-				goto next_hook;
-			if (err == -ESRCH &&
-			   (verdict & NF_VERDICT_FLAG_QUEUE_BYPASS))
-				goto next_hook;
-			kfree_skb(skb);
-		}
+		if (!nf_queue(skb, elem, pf, hook, indev, outdev, okfn,
+			      verdict >> NF_VERDICT_BITS))
+			goto next_hook;
 	}
 	rcu_read_unlock();
 	return ret;
@@ -222,7 +231,7 @@ EXPORT_SYMBOL(skb_make_writable);
 /* This does not belong here, but locally generated errors need it if connection
    tracking in use: without this, connection may not be in hash table, and hence
    manufactured ICMP or RST packets will not be associated with it. */
-void (*ip_ct_attach)(struct sk_buff *, struct sk_buff *) __rcu __read_mostly;
+void (*ip_ct_attach)(struct sk_buff *, struct sk_buff *);//指向nf_conntrack_attach， 见nf_conntrack_init
 EXPORT_SYMBOL(ip_ct_attach);
 
 void nf_ct_attach(struct sk_buff *new, struct sk_buff *skb)
@@ -239,7 +248,7 @@ void nf_ct_attach(struct sk_buff *new, struct sk_buff *skb)
 }
 EXPORT_SYMBOL(nf_ct_attach);
 
-void (*nf_ct_destroy)(struct nf_conntrack *) __rcu __read_mostly;
+void (*nf_ct_destroy)(struct nf_conntrack *);//指向destroy_conntrack，见nf_conntrack_init 
 EXPORT_SYMBOL(nf_ct_destroy);
 
 void nf_conntrack_destroy(struct nf_conntrack *nfct)

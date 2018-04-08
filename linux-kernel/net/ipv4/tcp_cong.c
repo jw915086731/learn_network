@@ -75,6 +75,7 @@ void tcp_unregister_congestion_control(struct tcp_congestion_ops *ca)
 EXPORT_SYMBOL_GPL(tcp_unregister_congestion_control);
 
 /* Assign choice of congestion control. */
+//，初始化拥塞控制模块
 void tcp_init_congestion_control(struct sock *sk)
 {
 	struct inet_connection_sock *icsk = inet_csk(sk);
@@ -196,10 +197,10 @@ void tcp_get_allowed_congestion_control(char *buf, size_t maxlen)
 int tcp_set_allowed_congestion_control(char *val)
 {
 	struct tcp_congestion_ops *ca;
-	char *saved_clone, *clone, *name;
+	char *clone, *name;
 	int ret = 0;
 
-	saved_clone = clone = kstrdup(val, GFP_USER);
+	clone = kstrdup(val, GFP_USER);
 	if (!clone)
 		return -ENOMEM;
 
@@ -226,7 +227,6 @@ int tcp_set_allowed_congestion_control(char *val)
 	}
 out:
 	spin_unlock(&tcp_cong_list_lock);
-	kfree(saved_clone);
 
 	return ret;
 }

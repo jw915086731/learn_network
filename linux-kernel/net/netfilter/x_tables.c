@@ -14,7 +14,6 @@
  */
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 #include <linux/kernel.h>
-#include <linux/module.h>
 #include <linux/socket.h>
 #include <linux/net.h>
 #include <linux/proc_fs.h>
@@ -24,7 +23,6 @@
 #include <linux/mutex.h>
 #include <linux/mm.h>
 #include <linux/slab.h>
-#include <linux/audit.h>
 #include <net/net_namespace.h>
 
 #include <linux/netfilter/x_tables.h>
@@ -40,22 +38,25 @@ MODULE_DESCRIPTION("{ip,ip6,arp,eb}_tables backend module");
 #define SMP_ALIGN(x) (((x) + SMP_CACHE_BYTES-1) & ~(SMP_CACHE_BYTES-1))
 
 struct compat_delta {
-	unsigned int offset; /* offset in kernel */
-	int delta; /* delta in 32bit user land */
+	struct compat_delta *next;
+	unsigned int offset;
+	int delta;
 };
-
-struct xt_af {
+/*
+Netfilter在内核中为防火墙系统维护了一个结构体，该结构体中存储的是内核中当前可用的所有match，target和table
+*/
+struct xt_af {//该结构中实际上值用了mutex锁用于netfilter的数据包过滤
 	struct mutex mutex;
-	struct list_head match;
-	struct list_head target;
+	struct list_head match;////每个match模块都会被注册到这里   实际上是添加到&net->xt.tables中的
+	struct list_head target;///每个target模块都会被注册到这里
 #ifdef CONFIG_COMPAT
 	struct mutex compat_mutex;
-	struct compat_delta *compat_tab;
-	unsigned int number; /* number of slots in compat_tab[] */
-	unsigned int cur; /* number of used slots in compat_tab[] */
+	struct compat_delta *compat_offsets;
 #endif
 };
 
+//参考http://blog.chinaunix.net/uid-23069658-id-3166140.html
+//其中xt变量是在net/netfilter/x_tables.c文件中的xt_init()函数中被分配存储空间并完成初始化的，xt分配的大小以当前内核所能支持的协议簇的数量有关
 static struct xt_af *xt;
 
 static const char *const xt_prefix[NFPROTO_NUMPROTO] = {
@@ -119,8 +120,10 @@ EXPORT_SYMBOL(xt_register_targets);
 void
 xt_unregister_targets(struct xt_target *target, unsigned int n)
 {
-	while (n-- > 0)
-		xt_unregister_target(&target[n]);
+	unsigned int i;
+
+	for (i = 0; i < n; i++)
+		xt_unregister_target(&target[i]);
 }
 EXPORT_SYMBOL(xt_unregister_targets);
 
@@ -175,8 +178,10 @@ EXPORT_SYMBOL(xt_register_matches);
 void
 xt_unregister_matches(struct xt_match *match, unsigned int n)
 {
-	while (n-- > 0)
-		xt_unregister_match(&match[n]);
+	unsigned int i;
+
+	for (i = 0; i < n; i++)
+		xt_unregister_match(&match[i]);
 }
 EXPORT_SYMBOL(xt_unregister_matches);
 
@@ -184,14 +189,14 @@ EXPORT_SYMBOL(xt_unregister_matches);
 /*
  * These are weird, but module loading must not be done with mutex
  * held (since they will register), and we have to have a single
- * function to use.
+ * function to use try_then_request_module().
  */
 
 /* Find match, grabs ref.  Returns ERR_PTR() on error. */
 struct xt_match *xt_find_match(u8 af, const char *name, u8 revision)
 {
 	struct xt_match *m;
-	int err = -ENOENT;
+	int err = 0;
 
 	if (mutex_lock_interruptible(&xt[af].mutex) != 0)
 		return ERR_PTR(-EINTR);
@@ -222,13 +227,9 @@ xt_request_find_match(uint8_t nfproto, const char *name, uint8_t revision)
 {
 	struct xt_match *match;
 
-	match = xt_find_match(nfproto, name, revision);
-	if (IS_ERR(match)) {
-		request_module("%st_%s", xt_prefix[nfproto], name);
-		match = xt_find_match(nfproto, name, revision);
-	}
-
-	return match;
+	match = try_then_request_module(xt_find_match(nfproto, name, revision),
+					"%st_%s", xt_prefix[nfproto], name);
+	return (match != NULL) ? match : ERR_PTR(-ENOENT);
 }
 EXPORT_SYMBOL_GPL(xt_request_find_match);
 
@@ -236,7 +237,7 @@ EXPORT_SYMBOL_GPL(xt_request_find_match);
 struct xt_target *xt_find_target(u8 af, const char *name, u8 revision)
 {
 	struct xt_target *t;
-	int err = -ENOENT;
+	int err = 0;
 
 	if (mutex_lock_interruptible(&xt[af].mutex) != 0)
 		return ERR_PTR(-EINTR);
@@ -266,13 +267,9 @@ struct xt_target *xt_request_find_target(u8 af, const char *name, u8 revision)
 {
 	struct xt_target *target;
 
-	target = xt_find_target(af, name, revision);
-	if (IS_ERR(target)) {
-		request_module("%st_%s", xt_prefix[af], name);
-		target = xt_find_target(af, name, revision);
-	}
-
-	return target;
+	target = try_then_request_module(xt_find_target(af, name, revision),
+					 "%st_%s", xt_prefix[af], name);
+	return (target != NULL) ? target : ERR_PTR(-ENOENT);
 }
 EXPORT_SYMBOL_GPL(xt_request_find_target);
 
@@ -425,66 +422,53 @@ int xt_check_match(struct xt_mtchk_param *par,
 EXPORT_SYMBOL_GPL(xt_check_match);
 
 #ifdef CONFIG_COMPAT
-int xt_compat_add_offset(u_int8_t af, unsigned int offset, int delta)
+int xt_compat_add_offset(u_int8_t af, unsigned int offset, short delta)
 {
-	struct xt_af *xp = &xt[af];
+	struct compat_delta *tmp;
 
-	if (!xp->compat_tab) {
-		if (!xp->number)
-			return -EINVAL;
-		xp->compat_tab = vmalloc(sizeof(struct compat_delta) * xp->number);
-		if (!xp->compat_tab)
-			return -ENOMEM;
-		xp->cur = 0;
+	tmp = kmalloc(sizeof(struct compat_delta), GFP_KERNEL);
+	if (!tmp)
+		return -ENOMEM;
+
+	tmp->offset = offset;
+	tmp->delta = delta;
+
+	if (xt[af].compat_offsets) {
+		tmp->next = xt[af].compat_offsets->next;
+		xt[af].compat_offsets->next = tmp;
+	} else {
+		xt[af].compat_offsets = tmp;
+		tmp->next = NULL;
 	}
-
-	if (xp->cur >= xp->number)
-		return -EINVAL;
-
-	if (xp->cur)
-		delta += xp->compat_tab[xp->cur - 1].delta;
-	xp->compat_tab[xp->cur].offset = offset;
-	xp->compat_tab[xp->cur].delta = delta;
-	xp->cur++;
 	return 0;
 }
 EXPORT_SYMBOL_GPL(xt_compat_add_offset);
 
 void xt_compat_flush_offsets(u_int8_t af)
 {
-	if (xt[af].compat_tab) {
-		vfree(xt[af].compat_tab);
-		xt[af].compat_tab = NULL;
-		xt[af].number = 0;
-		xt[af].cur = 0;
+	struct compat_delta *tmp, *next;
+
+	if (xt[af].compat_offsets) {
+		for (tmp = xt[af].compat_offsets; tmp; tmp = next) {
+			next = tmp->next;
+			kfree(tmp);
+		}
+		xt[af].compat_offsets = NULL;
 	}
 }
 EXPORT_SYMBOL_GPL(xt_compat_flush_offsets);
 
 int xt_compat_calc_jump(u_int8_t af, unsigned int offset)
 {
-	struct compat_delta *tmp = xt[af].compat_tab;
-	int mid, left = 0, right = xt[af].cur - 1;
+	struct compat_delta *tmp;
+	int delta;
 
-	while (left <= right) {
-		mid = (left + right) >> 1;
-		if (offset > tmp[mid].offset)
-			left = mid + 1;
-		else if (offset < tmp[mid].offset)
-			right = mid - 1;
-		else
-			return mid ? tmp[mid - 1].delta : 0;
-	}
-	return left ? tmp[left - 1].delta : 0;
+	for (tmp = xt[af].compat_offsets, delta = 0; tmp; tmp = tmp->next)
+		if (tmp->offset < offset)
+			delta += tmp->delta;
+	return delta;
 }
 EXPORT_SYMBOL_GPL(xt_compat_calc_jump);
-
-void xt_compat_init_offsets(u_int8_t af, unsigned int number)
-{
-	xt[af].number = number;
-	xt[af].cur = 0;
-}
-EXPORT_SYMBOL(xt_compat_init_offsets);
 
 int xt_compat_match_offset(const struct xt_match *match)
 {
@@ -763,8 +747,8 @@ void xt_compat_unlock(u_int8_t af)
 EXPORT_SYMBOL_GPL(xt_compat_unlock);
 #endif
 
-DEFINE_PER_CPU(seqcount_t, xt_recseq);
-EXPORT_PER_CPU_SYMBOL_GPL(xt_recseq);
+DEFINE_PER_CPU(struct xt_info_lock, xt_info_locks);
+EXPORT_PER_CPU_SYMBOL_GPL(xt_info_locks);
 
 static int xt_jumpstack_alloc(struct xt_table_info *i)
 {
@@ -777,11 +761,12 @@ static int xt_jumpstack_alloc(struct xt_table_info *i)
 
 	size = sizeof(void **) * nr_cpu_ids;
 	if (size > PAGE_SIZE)
-		i->jumpstack = vzalloc(size);
+		i->jumpstack = vmalloc(size);
 	else
-		i->jumpstack = kzalloc(size, GFP_KERNEL);
+		i->jumpstack = kmalloc(size, GFP_KERNEL);
 	if (i->jumpstack == NULL)
 		return -ENOMEM;
+	memset(i->jumpstack, 0, size);
 
 	i->stacksize *= xt_jumpstack_multiplier;
 	size = sizeof(void *) * i->stacksize;
@@ -843,25 +828,12 @@ xt_replace_table(struct xt_table *table,
 	 */
 	local_bh_enable();
 
-#ifdef CONFIG_AUDIT
-	if (audit_enabled) {
-		struct audit_buffer *ab;
-
-		ab = audit_log_start(current->audit_context, GFP_KERNEL,
-				     AUDIT_NETFILTER_CFG);
-		if (ab) {
-			audit_log_format(ab, "table=%s family=%u entries=%u",
-					 table->name, table->af,
-					 private->number);
-			audit_log_end(ab);
-		}
-	}
-#endif
-
 	return private;
 }
 EXPORT_SYMBOL_GPL(xt_replace_table);
 
+////iptable netfilter表注册添加到该链表中   iptable_filter.ko里面用结构xt_table,该表现源从packet_filter来的           见xt_register_table
+//table头部:net->xt.tables[table->af],所有table的头部链表
 struct xt_table *xt_register_table(struct net *net,
 				   const struct xt_table *input_table,
 				   struct xt_table_info *bootstrap,
@@ -877,7 +849,7 @@ struct xt_table *xt_register_table(struct net *net,
 		ret = -ENOMEM;
 		goto out;
 	}
-
+//xt_register_table(net, table, &bootstrap, newinfo);
 	ret = mutex_lock_interruptible(&xt[table->af].mutex);
 	if (ret != 0)
 		goto out_free;
@@ -893,7 +865,7 @@ struct xt_table *xt_register_table(struct net *net,
 	/* Simplifies replace_table code. */
 	table->private = bootstrap;
 
-	if (!xt_replace_table(table, 0, newinfo, &ret))
+	if (!xt_replace_table(table, 0, newinfo, &ret))//在该函数里面 table->private = newinfo;
 		goto unlock;
 
 	private = table->private;
@@ -1225,6 +1197,8 @@ static const struct file_operations xt_target_ops = {
  * This function will take care of creating and registering the necessary
  * Netfilter hooks for XT tables.
  */
+
+ //注册table表到netfilter
 struct nf_hook_ops *xt_hook_link(const struct xt_table *table, nf_hookfn *fn)
 {
 	unsigned int hook_mask = table->valid_hooks;
@@ -1362,7 +1336,9 @@ static int __init xt_init(void)
 	int rv;
 
 	for_each_possible_cpu(i) {
-		seqcount_init(&per_cpu(xt_recseq, i));
+		struct xt_info_lock *lock = &per_cpu(xt_info_locks, i);
+		spin_lock_init(&lock->lock);
+		lock->readers = 0;
 	}
 
 	xt = kmalloc(sizeof(struct xt_af) * NFPROTO_NUMPROTO, GFP_KERNEL);
@@ -1373,7 +1349,7 @@ static int __init xt_init(void)
 		mutex_init(&xt[i].mutex);
 #ifdef CONFIG_COMPAT
 		mutex_init(&xt[i].compat_mutex);
-		xt[i].compat_tab = NULL;
+		xt[i].compat_offsets = NULL;
 #endif
 		INIT_LIST_HEAD(&xt[i].target);
 		INIT_LIST_HEAD(&xt[i].match);

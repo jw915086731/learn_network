@@ -36,7 +36,7 @@
  *		modify it under the terms of the GNU General Public License
  *		as published by the Free Software Foundation; either version
  *		2 of the License, or (at your option) any later version.
- */
+ *///以太网网络设备驱动专用接口
 #include <linux/module.h>
 #include <linux/types.h>
 #include <linux/kernel.h>
@@ -154,21 +154,26 @@ EXPORT_SYMBOL(eth_rebuild_header);
  * The rule here is that we
  * assume 802.3 if the type field is short enough to be a length.
  * This is normal practice and works for any 'now in use' protocol.
- */
+  而L2数据帧有三种类型：单播，多播和广播，其中广播可看作多播的一种特殊情况。Bit 0用于表示多播还是单播，当bit 0为1时，
+  为多播，为0时，表示单播。
+ */ ////获取链路层协议类型  ETH_P_IP等 参考http://blog.csdn.net/magina3/article/details/7323265
+ //skb->protocol = eth_type_trans(skb, bp->dev);该函数对处理后skb>data跳过以太网报头，由mac_header指示以太网报头：http://www.linuxidc.com/Linux/2011-05/36065.htm
 __be16 eth_type_trans(struct sk_buff *skb, struct net_device *dev)
 {
 	struct ethhdr *eth;
+	unsigned char *rawp;
 
 	skb->dev = dev;
 	skb_reset_mac_header(skb);
 	skb_pull_inline(skb, ETH_HLEN);
 	eth = eth_hdr(skb);
 
-	if (unlikely(is_multicast_ether_addr(eth->h_dest))) {
+	if (unlikely(is_multicast_ether_addr(eth->h_dest))) {   /* 如果是多播地址，即bit0为1*/
 		if (!compare_ether_addr_64bits(eth->h_dest, dev->broadcast))
-			skb->pkt_type = PACKET_BROADCAST;
+			skb->pkt_type = PACKET_BROADCAST;// //与设备的广播地址相同，则帧为广播帧 
 		else
-			skb->pkt_type = PACKET_MULTICAST;
+			skb->pkt_type = PACKET_MULTICAST;//与设备的广播地址不同，则帧为多播帧
+        
 	}
 
 	/*
@@ -195,8 +200,14 @@ __be16 eth_type_trans(struct sk_buff *skb, struct net_device *dev)
 	if (netdev_uses_trailer_tags(dev))
 		return htons(ETH_P_TRAILER);
 
-	if (ntohs(eth->h_proto) >= 1536)
+       /*
+        当协议值大于136时，那么这个数据帧一定为ethernet frame 
+        因为802.2和802.3的对应域为帧长，均要小于或等于1500，而ethernet frame的协议类型都大于等于1536.
+        */
+	if (ntohs(eth->h_proto) >= 1536) //> 0X600
 		return eth->h_proto;
+
+	rawp = skb->data;
 
 	/*
 	 *      This is a magic hack to spot IPX packets. Older Novell breaks
@@ -204,7 +215,10 @@ __be16 eth_type_trans(struct sk_buff *skb, struct net_device *dev)
 	 *      layer. We look for FFFF which isn't a used 802.2 SSAP/DSAP. This
 	 *      won't work for fault tolerant netware but does for the rest.
 	 */
-	if (skb->len >= 2 && *(unsigned short *)(skb->data) == 0xFFFF)
+        /*
+            当IPX使用原始的802.3作为载体时，其头两个字节作为checksum，但是一般都设为0xffff。 
+            */
+	if (*(unsigned short *)rawp == 0xFFFF)
 		return htons(ETH_P_802_3);
 
 	/*
@@ -231,11 +245,11 @@ EXPORT_SYMBOL(eth_header_parse);
  * eth_header_cache - fill cache entry from neighbour
  * @neigh: source neighbour
  * @hh: destination cache entry
- * @type: Ethernet type field
  * Create an Ethernet header template from the neighbour.
  */
-int eth_header_cache(const struct neighbour *neigh, struct hh_cache *hh, __be16 type)
+int eth_header_cache(const struct neighbour *neigh, struct hh_cache *hh)
 {
+	__be16 type = hh->hh_type;
 	struct ethhdr *eth;
 	const struct net_device *dev = neigh->dev;
 
@@ -330,8 +344,8 @@ const struct header_ops eth_header_ops ____cacheline_aligned = {
  * ether_setup - setup Ethernet network device
  * @dev: network device
  * Fill in the fields of the device structure with Ethernet-generic values.
- */
-void ether_setup(struct net_device *dev)
+ *///以太网设备配置函数
+void ether_setup(struct net_device *dev)  //修改mtu等参数，见net_device_ops，例如//以e100为例，见e100_netdev_ops
 {
 	dev->header_ops		= &eth_header_ops;
 	dev->type		= ARPHRD_ETHER;
@@ -340,19 +354,16 @@ void ether_setup(struct net_device *dev)
 	dev->addr_len		= ETH_ALEN;
 	dev->tx_queue_len	= 1000;	/* Ethernet wants good queues */
 	dev->flags		= IFF_BROADCAST|IFF_MULTICAST;
-	dev->priv_flags		|= IFF_TX_SKB_SHARING;
 
 	memset(dev->broadcast, 0xFF, ETH_ALEN);
-
 }
 EXPORT_SYMBOL(ether_setup);
 
 /**
- * alloc_etherdev_mqs - Allocates and sets up an Ethernet device
+ * alloc_etherdev_mq - Allocates and sets up an Ethernet device
  * @sizeof_priv: Size of additional driver-private structure to be allocated
  *	for this Ethernet device
- * @txqs: The number of TX queues this device has.
- * @rxqs: The number of RX queues this device has.
+ * @queue_count: The number of queues this device has.
  *
  * Fill in the fields of the device structure with Ethernet-generic
  * values. Basically does everything except registering the device.
@@ -361,16 +372,15 @@ EXPORT_SYMBOL(ether_setup);
  * size (sizeof_priv).  A 32-byte (not bit) alignment is enforced for
  * this private data area.
  */
-
-struct net_device *alloc_etherdev_mqs(int sizeof_priv, unsigned int txqs,
-				      unsigned int rxqs)
+//这位以太网设备分配net_device结构，  //alloc_netdev分配好空间后，调用register_netdev完成注册，卸载的时候unregister_netdevice和free_netdev完成注销并释放内存
+struct net_device *alloc_etherdev_mq(int sizeof_priv, unsigned int queue_count)
 {
-	return alloc_netdev_mqs(sizeof_priv, "eth%d", ether_setup, txqs, rxqs);
+	return alloc_netdev_mq(sizeof_priv, "eth%d", ether_setup, queue_count);
 }
-EXPORT_SYMBOL(alloc_etherdev_mqs);
+EXPORT_SYMBOL(alloc_etherdev_mq);
 
 static size_t _format_mac_addr(char *buf, int buflen,
-			       const unsigned char *addr, int len)
+				const unsigned char *addr, int len)
 {
 	int i;
 	char *cp = buf;
@@ -379,7 +389,7 @@ static size_t _format_mac_addr(char *buf, int buflen,
 		cp += scnprintf(cp, buflen - (cp - buf), "%02x", addr[i]);
 		if (i == len - 1)
 			break;
-		cp += scnprintf(cp, buflen - (cp - buf), ":");
+		cp += strlcpy(cp, ":", buflen - (cp - buf));
 	}
 	return cp - buf;
 }
@@ -389,7 +399,7 @@ ssize_t sysfs_format_mac(char *buf, const unsigned char *addr, int len)
 	size_t l;
 
 	l = _format_mac_addr(buf, PAGE_SIZE, addr, len);
-	l += scnprintf(buf + l, PAGE_SIZE - l, "\n");
-	return (ssize_t)l;
+	l += strlcpy(buf + l, "\n", PAGE_SIZE - l);
+	return ((ssize_t) l);
 }
 EXPORT_SYMBOL(sysfs_format_mac);

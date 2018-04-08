@@ -15,8 +15,15 @@
 #include <net/netlink.h>
 #include <net/pkt_sched.h>
 
-
+/*
+入口流控对象的私有数据是：
 struct ingress_qdisc_data {
+       struct tcf_proto      *filter_list;
+};
+入口流控对象只有入队函数，没有出队函数。
+入队动作：先遍历过滤器，如果某个过滤器匹配，执行action（接收或者丢弃数据包），并将结果返回，最终根据这个返回的结果决定是否丢弃数据包。
+*/
+struct ingress_qdisc_data { //见ingress_qdisc_ops
 	struct tcf_proto	*filter_list;
 };
 
@@ -63,7 +70,8 @@ static int ingress_enqueue(struct sk_buff *skb, struct Qdisc *sch)
 
 	result = tc_classify(skb, p->filter_list, &res);
 
-	qdisc_bstats_update(sch, skb);
+	sch->bstats.packets++;
+	sch->bstats.bytes += qdisc_pkt_len(skb);
 	switch (result) {
 	case TC_ACT_SHOT:
 		result = TC_ACT_SHOT;
@@ -118,11 +126,26 @@ static const struct Qdisc_class_ops ingress_class_ops = {
 	.unbind_tcf	=	ingress_put,
 };
 
-static struct Qdisc_ops ingress_qdisc_ops __read_mostly = {
+/*
+入口流控对象的私有数据是：
+struct ingress_qdisc_data {
+       struct tcf_proto      *filter_list;
+};
+入口流控对象只有入队函数，没有出队函数。
+入队动作：先遍历过滤器，如果某个过滤器匹配，执行action（接收或者丢弃数据包），并将结果返回，最终根据这个返回的结果决定是否丢弃数据包。
+
+int netif_receive_skb(struct sk_buff *skb)à
+skb = handle_ing(skb, &pt_prev, &ret, orig_dev);à
+ing_filter(skb)
+增加一个入口流控队列# tc qdisc add dev eth0 ingress
+
+*/
+/*pfifo_qdisc_ops tbf_qdisc_ops sfq_qdisc_ops prio_class_ops这几个都为出口，ingress_qdisc_ops为入口 */
+static struct Qdisc_ops ingress_qdisc_ops { // __read_mostly = {
 	.cl_ops		=	&ingress_class_ops,
 	.id		=	"ingress",
 	.priv_size	=	sizeof(struct ingress_qdisc_data),
-	.enqueue	=	ingress_enqueue,
+	.enqueue	=	ingress_enqueue,////ingress通过ing_filter入队
 	.destroy	=	ingress_destroy,
 	.dump		=	ingress_dump,
 	.owner		=	THIS_MODULE,

@@ -57,7 +57,6 @@
 #include <linux/init.h>
 #include <linux/scatterlist.h>
 #include <linux/errqueue.h>
-#include <linux/prefetch.h>
 
 #include <net/protocol.h>
 #include <net/dst.h>
@@ -71,9 +70,12 @@
 
 #include "kmap_skb.h"
 
-static struct kmem_cache *skbuff_head_cache __read_mostly;
-static struct kmem_cache *skbuff_fclone_cache __read_mostly;
 
+//见函数skb_init, 分配SKB的两种方式见__alloc_skb
+static struct kmem_cache *skbuff_head_cache; //__read_mostly; //SKB都是从该高速缓存中分配的，和下面的clone_cache的区别是，从该缓存中分配的长度为sizeof(struct sk_buff),下面的这个是2倍sizeof+sizeof(atomic_t) 
+                                                           //参考32页图3-12
+static struct kmem_cache *skbuff_fclone_cache; //__read_mostly;//如果在分配SKB的时候就知道可能该SKB会被克隆，那么就从这个高速缓存分配空间，这样可以提高效率 
+                                                            //这里面的父子SKB指向同一块数据区data
 static void sock_pipe_buf_release(struct pipe_inode_info *pipe,
 				  struct pipe_buffer *buf)
 {
@@ -167,6 +169,8 @@ static void skb_under_panic(struct sk_buff *skb, int sz, void *here)
  *
  *	Buffers may only be allocated from interrupts using a @gfp_mask of
  *	%GFP_ATOMIC.
+ size为待分配的SKB线性缓冲区的长度。
+ 克隆情况下分配的是两个sizeof(struct sk_buffer)。但线性数据区接非线性数据区是一个
  */
 struct sk_buff *__alloc_skb(unsigned int size, gfp_t gfp_mask,
 			    int fclone, int node)
@@ -174,31 +178,23 @@ struct sk_buff *__alloc_skb(unsigned int size, gfp_t gfp_mask,
 	struct kmem_cache *cache;
 	struct skb_shared_info *shinfo;
 	struct sk_buff *skb;
-	u8 *data;
+	u8 *data;                                                       
+	                                                                    
+                                                              //skbuff_head_cache就为sizeof(sk_buffer)
+	cache = fclone ? skbuff_fclone_cache : skbuff_head_cache;//定义在skbuff.c  如果是clone则从skbuff_fclone_cache分配，长度为2*sizeof(sk_buf)+4
 
-	cache = fclone ? skbuff_fclone_cache : skbuff_head_cache;
-
-	/* Get the HEAD */
-	skb = kmem_cache_alloc_node(cache, gfp_mask & ~__GFP_DMA, node);
+	/* Get the HEAD  分配一个sk_buff结构的空间*/
+	skb = kmem_cache_alloc_node(cache, gfp_mask & ~__GFP_DMA, node);//这里分配空间去掉DMA的原因是,DMA空间小，切有特殊用途
 	if (!skb)
 		goto out;
 	prefetchw(skb);
 
-	/* We do our best to align skb_shared_info on a separate cache
-	 * line. It usually works because kmalloc(X > SMP_CACHE_BYTES) gives
-	 * aligned memory blocks, unless SLUB/SLAB debug is enabled.
-	 * Both skb->head and skb_shared_info are cache line aligned.
-	 */
 	size = SKB_DATA_ALIGN(size);
-	size += SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
-	data = kmalloc_node_track_caller(size, gfp_mask, node);
+	/* 分配数据缓冲区 这里包括sizeof(struct skb_shared_info) */
+	data = kmalloc_node_track_caller(size + sizeof(struct skb_shared_info),//data区从DMA分配的原因是，硬件可以直接从DMA获取数据
+			gfp_mask, node);
 	if (!data)
 		goto nodata;
-	/* kmalloc(size) might give us more room than requested.
-	 * Put skb_shared_info exactly at the end of allocated zone,
-	 * to allow max possible filling before reallocation.
-	 */
-	size = SKB_WITH_OVERHEAD(ksize(data));
 	prefetchw(data + size);
 
 	/*
@@ -207,24 +203,24 @@ struct sk_buff *__alloc_skb(unsigned int size, gfp_t gfp_mask,
 	 * the tail pointer in struct sk_buff!
 	 */
 	memset(skb, 0, offsetof(struct sk_buff, tail));
-	/* Account for allocated memory : skb + skb->head */
-	skb->truesize = SKB_TRUESIZE(size);
+	skb->truesize = size + sizeof(struct sk_buff);
 	atomic_set(&skb->users, 1);
 	skb->head = data;
 	skb->data = data;
-	skb_reset_tail_pointer(skb);
+	skb_reset_tail_pointer(skb);//最开始的时候head data和tail都执行线性数据头部
 	skb->end = skb->tail + size;
+	kmemcheck_annotate_bitfield(skb, flags1);
+	kmemcheck_annotate_bitfield(skb, flags2);
 #ifdef NET_SKBUFF_DATA_USES_OFFSET
 	skb->mac_header = ~0U;
 #endif
 
 	/* make sure we initialize shinfo sequentially */
-	shinfo = skb_shinfo(skb);
+	shinfo = skb_shinfo(skb);//shinfo执行data线性数据区的尾部
 	memset(shinfo, 0, offsetof(struct skb_shared_info, dataref));
-	atomic_set(&shinfo->dataref, 1);
-	kmemcheck_annotate_variable(shinfo->destructor_arg);
+	atomic_set(&shinfo->dataref, 1);//前面开辟data空间的时候有算上sizeof(struct skb_shared_info)
 
-	if (fclone) {
+	if (fclone) {//这时候子SKB没有指向data区   克隆情况下分配的是两个sizeof(struct sk_buffer)。但线性数据区接非线性数据区是一个
 		struct sk_buff *child = skb + 1;
 		atomic_t *fclone_ref = (atomic_t *) (child + 1);
 
@@ -260,9 +256,10 @@ EXPORT_SYMBOL(__alloc_skb);
 struct sk_buff *__netdev_alloc_skb(struct net_device *dev,
 		unsigned int length, gfp_t gfp_mask)
 {
+	int node = dev->dev.parent ? dev_to_node(dev->dev.parent) : -1;
 	struct sk_buff *skb;
 
-	skb = __alloc_skb(length + NET_SKB_PAD, gfp_mask, 0, NUMA_NO_NODE);
+	skb = __alloc_skb(length + NET_SKB_PAD, gfp_mask, 0, node);
 	if (likely(skb)) {
 		skb_reserve(skb, NET_SKB_PAD);
 		skb->dev = dev;
@@ -270,6 +267,16 @@ struct sk_buff *__netdev_alloc_skb(struct net_device *dev,
 	return skb;
 }
 EXPORT_SYMBOL(__netdev_alloc_skb);
+
+struct page *__netdev_alloc_page(struct net_device *dev, gfp_t gfp_mask)
+{
+	int node = dev->dev.parent ? dev_to_node(dev->dev.parent) : -1;
+	struct page *page;
+
+	page = alloc_pages_node(node, gfp_mask, 0);
+	return page;
+}
+EXPORT_SYMBOL(__netdev_alloc_page);
 
 void skb_add_rx_frag(struct sk_buff *skb, int i, struct page *page, int off,
 		int size)
@@ -316,11 +323,13 @@ static void skb_drop_list(struct sk_buff **listp)
 	} while (list);
 }
 
+//这个函数是用来释放当前skb的frag_list区的
 static inline void skb_drop_fraglist(struct sk_buff *skb)
 {
 	skb_drop_list(&skb_shinfo(skb)->frag_list);
 }
 
+///* 对当前skb的frag_list区链上的每个skb增加引用计数。 */
 static void skb_clone_fraglist(struct sk_buff *skb)
 {
 	struct sk_buff *list;
@@ -331,36 +340,28 @@ static void skb_clone_fraglist(struct sk_buff *skb)
 
 static void skb_release_data(struct sk_buff *skb)
 {
+    /* 查看skb是否被clone？skb_shinfo的dataref是否为0？
+        * 如果是，那么就释放skb非线性区域和线性区域。 */
+
 	if (!skb->cloned ||
 	    !atomic_sub_return(skb->nohdr ? (1 << SKB_DATAREF_SHIFT) + 1 : 1,
 			       &skb_shinfo(skb)->dataref)) {
-		if (skb_shinfo(skb)->nr_frags) {
+		if (skb_shinfo(skb)->nr_frags) { /* 释放page frags区 */
 			int i;
 			for (i = 0; i < skb_shinfo(skb)->nr_frags; i++)
-				skb_frag_unref(skb, i);
+				put_page(skb_shinfo(skb)->frags[i].page);
 		}
 
-		/*
-		 * If skb buf is from userspace, we need to notify the caller
-		 * the lower device DMA has done;
-		 */
-		if (skb_shinfo(skb)->tx_flags & SKBTX_DEV_ZEROCOPY) {
-			struct ubuf_info *uarg;
-
-			uarg = skb_shinfo(skb)->destructor_arg;
-			if (uarg->callback)
-				uarg->callback(uarg);
-		}
-
-		if (skb_has_frag_list(skb))
+		if (skb_has_frags(skb)) /* 释放frag_list区 */
 			skb_drop_fraglist(skb);
 
-		kfree(skb->head);
+		kfree(skb->head);/* 释放线性区域 */
 	}
 }
 
 /*
  *	Free an skbuff by memory without cleaning the state.
+ /* 把skb自身和线性，非线性区域全部释放
  */
 static void kfree_skbmem(struct sk_buff *skb)
 {
@@ -372,13 +373,13 @@ static void kfree_skbmem(struct sk_buff *skb)
 		kmem_cache_free(skbuff_head_cache, skb);
 		break;
 
-	case SKB_FCLONE_ORIG:
+	case SKB_FCLONE_ORIG://释放父SKB
 		fclone_ref = (atomic_t *) (skb + 2);
 		if (atomic_dec_and_test(fclone_ref))
 			kmem_cache_free(skbuff_fclone_cache, skb);
 		break;
 
-	case SKB_FCLONE_CLONE:
+	case SKB_FCLONE_CLONE://释放子SKB
 		fclone_ref = (atomic_t *) (skb + 1);
 		other = skb - 1;
 
@@ -393,6 +394,7 @@ static void kfree_skbmem(struct sk_buff *skb)
 	}
 }
 
+//释放分片相关skb_shared_info相关的内存
 static void skb_release_head_state(struct sk_buff *skb)
 {
 	skb_dst_drop(skb);
@@ -405,8 +407,6 @@ static void skb_release_head_state(struct sk_buff *skb)
 	}
 #if defined(CONFIG_NF_CONNTRACK) || defined(CONFIG_NF_CONNTRACK_MODULE)
 	nf_conntrack_put(skb->nfct);
-#endif
-#ifdef NET_SKBUFF_NF_DEFRAG_NEEDED
 	nf_conntrack_put_reasm(skb->nfct_reasm);
 #endif
 #ifdef CONFIG_BRIDGE_NETFILTER
@@ -439,8 +439,8 @@ static void skb_release_all(struct sk_buff *skb)
 
 void __kfree_skb(struct sk_buff *skb)
 {
-	skb_release_all(skb);
-	kfree_skbmem(skb);
+	skb_release_all(skb);//释放data数据部分，包括扩shareinof分片的
+	kfree_skbmem(skb);//释放SKB描述符
 }
 EXPORT_SYMBOL(__kfree_skb);
 
@@ -450,6 +450,7 @@ EXPORT_SYMBOL(__kfree_skb);
  *
  *	Drop a reference to the buffer and free it if the usage count has
  *	hit zero.
+ user引用计数为0的时候才真正释放空间
  */
 void kfree_skb(struct sk_buff *skb)
 {
@@ -480,34 +481,9 @@ void consume_skb(struct sk_buff *skb)
 		smp_rmb();
 	else if (likely(!atomic_dec_and_test(&skb->users)))
 		return;
-	trace_consume_skb(skb);
 	__kfree_skb(skb);
 }
 EXPORT_SYMBOL(consume_skb);
-
-/**
- * 	skb_recycle - clean up an skb for reuse
- * 	@skb: buffer
- *
- * 	Recycles the skb to be reused as a receive buffer. This
- * 	function does any necessary reference count dropping, and
- * 	cleans up the skbuff as if it just came from __alloc_skb().
- */
-void skb_recycle(struct sk_buff *skb)
-{
-	struct skb_shared_info *shinfo;
-
-	skb_release_head_state(skb);
-
-	shinfo = skb_shinfo(skb);
-	memset(shinfo, 0, offsetof(struct skb_shared_info, dataref));
-	atomic_set(&shinfo->dataref, 1);
-
-	memset(skb, 0, offsetof(struct sk_buff, tail));
-	skb->data = skb->head + NET_SKB_PAD;
-	skb_reset_tail_pointer(skb);
-}
-EXPORT_SYMBOL(skb_recycle);
 
 /**
  *	skb_recycle_check - check if skb can be reused for receive
@@ -523,10 +499,30 @@ EXPORT_SYMBOL(skb_recycle);
  */
 bool skb_recycle_check(struct sk_buff *skb, int skb_size)
 {
-	if (!skb_is_recycleable(skb, skb_size))
+	struct skb_shared_info *shinfo;
+
+	if (irqs_disabled())
 		return false;
 
-	skb_recycle(skb);
+	if (skb_is_nonlinear(skb) || skb->fclone != SKB_FCLONE_UNAVAILABLE)
+		return false;
+
+	skb_size = SKB_DATA_ALIGN(skb_size + NET_SKB_PAD);
+	if (skb_end_pointer(skb) - skb->head < skb_size)
+		return false;
+
+	if (skb_shared(skb) || skb_cloned(skb))
+		return false;
+
+	skb_release_head_state(skb);
+
+	shinfo = skb_shinfo(skb);
+	memset(shinfo, 0, offsetof(struct skb_shared_info, dataref));
+	atomic_set(&shinfo->dataref, 1);
+
+	memset(skb, 0, offsetof(struct sk_buff, tail));
+	skb->data = skb->head + NET_SKB_PAD;
+	skb_reset_tail_pointer(skb);
 
 	return true;
 }
@@ -541,8 +537,6 @@ static void __copy_skb_header(struct sk_buff *new, const struct sk_buff *old)
 	new->mac_header		= old->mac_header;
 	skb_dst_copy(new, old);
 	new->rxhash		= old->rxhash;
-	new->ooo_okay		= old->ooo_okay;
-	new->l4_rxhash		= old->l4_rxhash;
 #ifdef CONFIG_XFRM
 	new->sp			= secpath_get(old->sp);
 #endif
@@ -553,6 +547,7 @@ static void __copy_skb_header(struct sk_buff *new, const struct sk_buff *old)
 	new->ip_summed		= old->ip_summed;
 	skb_copy_queue_mapping(new, old);
 	new->priority		= old->priority;
+	new->deliver_no_wcard	= old->deliver_no_wcard;
 #if defined(CONFIG_IP_VS) || defined(CONFIG_IP_VS_MODULE)
 	new->ipvs_property	= old->ipvs_property;
 #endif
@@ -579,6 +574,7 @@ static void __copy_skb_header(struct sk_buff *new, const struct sk_buff *old)
  * You should not add any new code to this function.  Add it to
  * __copy_skb_header above instead.
  */
+ //SKB标示父SKB,n标示子SKB  两个SKB头部struct完全相同，并指向相同的数据区
 static struct sk_buff *__skb_clone(struct sk_buff *n, struct sk_buff *skb)
 {
 #define C(x) n->x = skb->x
@@ -601,7 +597,7 @@ static struct sk_buff *__skb_clone(struct sk_buff *n, struct sk_buff *skb)
 	C(truesize);
 	atomic_set(&n->users, 1);
 
-	atomic_inc(&(skb_shinfo(skb)->dataref));
+	atomic_inc(&(skb_shinfo(skb)->dataref));//又多了一个SKB指向数据部分
 	skb->cloned = 1;
 
 	return n;
@@ -625,66 +621,6 @@ struct sk_buff *skb_morph(struct sk_buff *dst, struct sk_buff *src)
 }
 EXPORT_SYMBOL_GPL(skb_morph);
 
-/*	skb_copy_ubufs	-	copy userspace skb frags buffers to kernel
- *	@skb: the skb to modify
- *	@gfp_mask: allocation priority
- *
- *	This must be called on SKBTX_DEV_ZEROCOPY skb.
- *	It will copy all frags into kernel and drop the reference
- *	to userspace pages.
- *
- *	If this function is called from an interrupt gfp_mask() must be
- *	%GFP_ATOMIC.
- *
- *	Returns 0 on success or a negative error code on failure
- *	to allocate kernel memory to copy to.
- */
-int skb_copy_ubufs(struct sk_buff *skb, gfp_t gfp_mask)
-{
-	int i;
-	int num_frags = skb_shinfo(skb)->nr_frags;
-	struct page *page, *head = NULL;
-	struct ubuf_info *uarg = skb_shinfo(skb)->destructor_arg;
-
-	for (i = 0; i < num_frags; i++) {
-		u8 *vaddr;
-		skb_frag_t *f = &skb_shinfo(skb)->frags[i];
-
-		page = alloc_page(GFP_ATOMIC);
-		if (!page) {
-			while (head) {
-				struct page *next = (struct page *)head->private;
-				put_page(head);
-				head = next;
-			}
-			return -ENOMEM;
-		}
-		vaddr = kmap_skb_frag(&skb_shinfo(skb)->frags[i]);
-		memcpy(page_address(page),
-		       vaddr + f->page_offset, skb_frag_size(f));
-		kunmap_skb_frag(vaddr);
-		page->private = (unsigned long)head;
-		head = page;
-	}
-
-	/* skb frags release userspace buffers */
-	for (i = 0; i < skb_shinfo(skb)->nr_frags; i++)
-		skb_frag_unref(skb, i);
-
-	uarg->callback(uarg);
-
-	/* skb frags point to kernel buffers */
-	for (i = skb_shinfo(skb)->nr_frags; i > 0; i--) {
-		__skb_fill_page_desc(skb, i-1, head, 0,
-				     skb_shinfo(skb)->frags[i - 1].size);
-		head = (struct page *)head->private;
-	}
-
-	skb_shinfo(skb)->tx_flags &= ~SKBTX_DEV_ZEROCOPY;
-	return 0;
-}
-
-
 /**
  *	skb_clone	-	duplicate an sk_buff
  *	@skb: buffer to clone
@@ -698,23 +634,21 @@ int skb_copy_ubufs(struct sk_buff *skb, gfp_t gfp_mask)
  *	If this function is called from an interrupt gfp_mask() must be
  *	%GFP_ATOMIC.
  */
-
-struct sk_buff *skb_clone(struct sk_buff *skb, gfp_t gfp_mask)
+//克隆只是分配SKB，并增加数据缓冲区的引用计数     skb_clone一般只修改数据SKB描述符，pskb_copy的使用场合一般是既要修改SKB描述符，也要修改数据缓冲区部分，所有SKB和data区要同时复制
+//新的skb的data指针和skb data指针指向同一个data，skb结构是新的skb。 一般在以下情况下使用:当指需要修改skb结构部分，而不需要修改data数据(包括二 三层等，也包括data数据payload部分)的时候用这个
+//注意参数SKB必须是__alloc_skb中为fclone情况下分片的SKB
+struct sk_buff *skb_clone(struct sk_buff *skb, gfp_t gfp_mask) //注意skb_clone和pskb_copy()与skb_copy()的区别
 {
 	struct sk_buff *n;
 
-	if (skb_shinfo(skb)->tx_flags & SKBTX_DEV_ZEROCOPY) {
-		if (skb_copy_ubufs(skb, gfp_mask))
-			return NULL;
-	}
-
-	n = skb + 1;
+	n = skb + 1;//子SKB
+	/* 判断原始skb是否是从skbuff_fclone_cache 缓冲区中分配的，从skbuff_fclone_cache 分配将预先为clone的skb分配好内存，同时判定该预先分配的clone skb是否被使用 */
 	if (skb->fclone == SKB_FCLONE_ORIG &&
-	    n->fclone == SKB_FCLONE_UNAVAILABLE) {
-		atomic_t *fclone_ref = (atomic_t *) (n + 1);
-		n->fclone = SKB_FCLONE_CLONE;
+	    n->fclone == SKB_FCLONE_UNAVAILABLE) { //表面是从skbuff_fclone_cache中分配的SKB,子SKB的data区是空的
+		atomic_t *fclone_ref = (atomic_t *) (n + 1);//N+1刚好对应skbuff_fclone_cache中分配空间的最后四字节，用来表示应用技术
+		n->fclone = SKB_FCLONE_CLONE;/* 置clone的skb中fclone值为SKB_FCLONE_CLONE ，标明其数据区指向原始skb同一数据区 */
 		atomic_inc(fclone_ref);
-	} else {
+	} else {//从新分配一个skb  /* 主skb并未同时分配clone skb的情况，将重新独立分配skb结构作为clone的skb */
 		n = kmem_cache_alloc(skbuff_head_cache, gfp_mask);
 		if (!n)
 			return NULL;
@@ -767,13 +701,20 @@ static void copy_skb_header(struct sk_buff *new, const struct sk_buff *old)
  *	function is not recommended for use in circumstances when only
  *	header is going to be modified. Use pskb_copy() instead.
  */
-
-struct sk_buff *skb_copy(const struct sk_buff *skb, gfp_t gfp_mask)
+//如果要复制SKB  data区和分片相关，只能用skb_copy，pskb_copy不能复制分片相关的,pskb_copy值复制head和data之间的数据  //复制SKB描述符，data区以及分片区  参考41页
+//pskb_copy和skb_copy的区别是pskb不需要拷贝skb_shinfo中的数据，skb_copy则需要修改skb_shinfo中的数据
+struct sk_buff *skb_copy(const struct sk_buff *skb, gfp_t gfp_mask)//注意skb_clone和pskb_copy()与skb_copy()的区别
 {
-	int headerlen = skb_headroom(skb);
-	unsigned int size = (skb_end_pointer(skb) - skb->head) + skb->data_len;
-	struct sk_buff *n = alloc_skb(size, gfp_mask);
-
+	int headerlen = skb->data - skb->head;
+	/*
+	 *	Allocate the copy buffer
+	 */
+	struct sk_buff *n;
+#ifdef NET_SKBUFF_DATA_USES_OFFSET
+	n = alloc_skb(skb->end + skb->data_len, gfp_mask);
+#else
+	n = alloc_skb(skb->end - skb->head + skb->data_len, gfp_mask);
+#endif
 	if (!n)
 		return NULL;
 
@@ -802,17 +743,24 @@ EXPORT_SYMBOL(skb_copy);
  *	or the pointer to the buffer on success.
  *	The returned buffer has a reference count of 1.
  */
-
-struct sk_buff *pskb_copy(struct sk_buff *skb, gfp_t gfp_mask)
+//只复制一份SKB描述符，并复制基本的data区，不包括分片的数据        参考41页
+//pskb_copy和skb_copy的区别是pskb不需要拷贝skb_shinfo(这部分数据时共享的)中的数据，skb_copy则需要修改skb_shinfo(各自有独立的shinfo数据)中的数据
+struct sk_buff *pskb_copy(struct sk_buff *skb, gfp_t gfp_mask)//注意skb_clone和pskb_copy()与skb_copy()的区别
 {
-	unsigned int size = skb_end_pointer(skb) - skb->head;
-	struct sk_buff *n = alloc_skb(size, gfp_mask);
-
+	/*
+	 *	Allocate the copy buffer
+	 */
+	struct sk_buff *n;
+#ifdef NET_SKBUFF_DATA_USES_OFFSET
+	n = alloc_skb(skb->end, gfp_mask);
+#else
+	n = alloc_skb(skb->end - skb->head, gfp_mask);
+#endif
 	if (!n)
 		goto out;
 
 	/* Set the data pointer */
-	skb_reserve(n, skb_headroom(skb));
+	skb_reserve(n, skb->data - skb->head);
 	/* Set the tail pointer and length */
 	skb_put(n, skb_headlen(skb));
 	/* Copy the bytes */
@@ -825,21 +773,14 @@ struct sk_buff *pskb_copy(struct sk_buff *skb, gfp_t gfp_mask)
 	if (skb_shinfo(skb)->nr_frags) {
 		int i;
 
-		if (skb_shinfo(skb)->tx_flags & SKBTX_DEV_ZEROCOPY) {
-			if (skb_copy_ubufs(skb, gfp_mask)) {
-				kfree_skb(n);
-				n = NULL;
-				goto out;
-			}
-		}
 		for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
 			skb_shinfo(n)->frags[i] = skb_shinfo(skb)->frags[i];
-			skb_frag_ref(skb, i);
+			get_page(skb_shinfo(n)->frags[i].page);
 		}
 		skb_shinfo(n)->nr_frags = i;
 	}
 
-	if (skb_has_frag_list(skb)) {
+	if (skb_has_frags(skb)) {
 		skb_shinfo(n)->frag_list = skb_shinfo(skb)->frag_list;
 		skb_clone_fraglist(n);
 	}
@@ -865,77 +806,51 @@ EXPORT_SYMBOL(pskb_copy);
  *	All the pointers pointing into skb header may change and must be
  *	reloaded after call to this function.
  */
-
-int pskb_expand_head(struct sk_buff *skb, int nhead, int ntail,
+ //nhead为扩展的headroom空间的长度，nhead是向前扩展，ntail向后扩展，ntail为扩展的tailroom空间的长度。参考46页码图3-30 全部都变为线性缓冲区
+int pskb_expand_head(struct sk_buff *skb, int nhead, int ntail,//注意skb_cow  skb_realloc_headroom和pskb_expand_head的区别
 		     gfp_t gfp_mask)
 {
 	int i;
 	u8 *data;
-	int size = nhead + (skb_end_pointer(skb) - skb->head) + ntail;
+#ifdef NET_SKBUFF_DATA_USES_OFFSET
+	int size = nhead + skb->end + ntail;
+#else
+	int size = nhead + (skb->end - skb->head) + ntail;
+#endif
 	long off;
-	bool fastpath;
 
 	BUG_ON(nhead < 0);
 
-	if (skb_shared(skb))
+	if (skb_shared(skb))//该SKB只能被应用一次
 		BUG();
 
 	size = SKB_DATA_ALIGN(size);
-
-	/* Check if we can avoid taking references on fragments if we own
-	 * the last reference on skb->head. (see skb_release_data())
-	 */
-	if (!skb->cloned)
-		fastpath = true;
-	else {
-		int delta = skb->nohdr ? (1 << SKB_DATAREF_SHIFT) + 1 : 1;
-		fastpath = atomic_read(&skb_shinfo(skb)->dataref) == delta;
-	}
-
-	if (fastpath &&
-	    size + sizeof(struct skb_shared_info) <= ksize(skb->head)) {
-		memmove(skb->head + size, skb_shinfo(skb),
-			offsetof(struct skb_shared_info,
-				 frags[skb_shinfo(skb)->nr_frags]));
-		memmove(skb->head + nhead, skb->head,
-			skb_tail_pointer(skb) - skb->head);
-		off = nhead;
-		goto adjust_others;
-	}
 
 	data = kmalloc(size + sizeof(struct skb_shared_info), gfp_mask);
 	if (!data)
 		goto nodata;
 
 	/* Copy only real data... and, alas, header. This should be
-	 * optimized for the cases when header is void.
-	 */
-	memcpy(data + nhead, skb->head, skb_tail_pointer(skb) - skb->head);
+	 * optimized for the cases when header is void. */
+#ifdef NET_SKBUFF_DATA_USES_OFFSET
+	memcpy(data + nhead, skb->head, skb->tail);
+#else
+	memcpy(data + nhead, skb->head, skb->tail - skb->head);//拷贝data区
+#endif
+	memcpy(data + size, skb_end_pointer(skb),
+	       sizeof(struct skb_shared_info));//拷贝非线性区，即分片区
 
-	memcpy((struct skb_shared_info *)(data + size),
-	       skb_shinfo(skb),
-	       offsetof(struct skb_shared_info, frags[skb_shinfo(skb)->nr_frags]));
+	for (i = 0; i < skb_shinfo(skb)->nr_frags; i++)
+		get_page(skb_shinfo(skb)->frags[i].page);
 
-	if (fastpath) {
-		kfree(skb->head);
-	} else {
-		/* copy this zero copy skb frags */
-		if (skb_shinfo(skb)->tx_flags & SKBTX_DEV_ZEROCOPY) {
-			if (skb_copy_ubufs(skb, gfp_mask))
-				goto nofrags;
-		}
-		for (i = 0; i < skb_shinfo(skb)->nr_frags; i++)
-			skb_frag_ref(skb, i);
+	if (skb_has_frags(skb))//表示frag_list不为NULL，即有分片缓存在该frag_list链表上面
+		skb_clone_fraglist(skb);
 
-		if (skb_has_frag_list(skb))
-			skb_clone_fraglist(skb);
+	skb_release_data(skb);
 
-		skb_release_data(skb);
-	}
 	off = (data + nhead) - skb->head;
 
 	skb->head     = data;
-adjust_others:
 	skb->data    += off;
 #ifdef NET_SKBUFF_DATA_USES_OFFSET
 	skb->end      = size;
@@ -958,16 +873,16 @@ adjust_others:
 	atomic_set(&skb_shinfo(skb)->dataref, 1);
 	return 0;
 
-nofrags:
-	kfree(data);
 nodata:
 	return -ENOMEM;
 }
 EXPORT_SYMBOL(pskb_expand_head);
 
 /* Make private copy of skb with writable head and some headroom */
-
-struct sk_buff *skb_realloc_headroom(struct sk_buff *skb, unsigned int headroom)
+//创建一个新的skb描述符，同时给这个新的skb描述符扩展headroom个头部字节，源skb在该函数中并没有释放
+struct sk_buff *skb_realloc_headroom(struct sk_buff *skb, unsigned int headroom) 
+//注意skb_cow skb_ realloc_headroom和pskb_expand_head的区别
+//headroom指的是data区域前面的剩余空间，tailroom指的是tail后面剩下的线性空间，见樊东东上P43
 {
 	struct sk_buff *skb2;
 	int delta = headroom - skb_headroom(skb);
@@ -1108,6 +1023,13 @@ EXPORT_SYMBOL(skb_pad);
  *	exceed the total buffer size the kernel will panic. A pointer to the
  *	first byte of the extra data is returned.
  */
+ /*
+ skb_put向后填充，data不变，tail向右移动，len增加; 
+ skb_push 向前填充，data前移，tail不变，len增加
+ skb_pull 取数据，data后移,tail不变,len减少
+ skb_reserve data和tail同时向后移动相同len，实际上len还是不变，只是headerroom增加了
+ 参考http://www.cnblogs.com/qq78292959/archive/2012/06/06/2538358.html
+*/
 unsigned char *skb_put(struct sk_buff *skb, unsigned int len)
 {
 	unsigned char *tmp = skb_tail_pointer(skb);
@@ -1128,7 +1050,13 @@ EXPORT_SYMBOL(skb_put);
  *	This function extends the used data area of the buffer at the buffer
  *	start. If this would exceed the total buffer headroom the kernel will
  *	panic. A pointer to the first byte of the extra data is returned.
- */
+ */ /*
+ skb_put向后填充，data不变，tail向右移动，len增加; 
+ skb_push 向前填充，data前移，tail不变，len增加
+ skb_pull 取数据，data后移,tail不变,len减少
+ skb_reserve data和tail同时向后移动相同len，实际上len还是不变，只是headerroom增加了
+ 参考http://www.cnblogs.com/qq78292959/archive/2012/06/06/2538358.html
+*/
 unsigned char *skb_push(struct sk_buff *skb, unsigned int len)
 {
 	skb->data -= len;
@@ -1148,7 +1076,13 @@ EXPORT_SYMBOL(skb_push);
  *	the memory to the headroom. A pointer to the next data in the buffer
  *	is returned. Once the data has been pulled future pushes will overwrite
  *	the old data.
- */
+ */ /*
+ skb_put向后填充，data不变，tail向右移动，len增加; 
+ skb_push 向前填充，data前移，tail不变，len增加
+ skb_pull 取数据，data后移,tail不变,len减少
+ skb_reserve data和tail同时向后移动相同len，实际上len还是不变，只是headerroom增加了
+ 参考http://www.cnblogs.com/qq78292959/archive/2012/06/06/2538358.html
+*/
 unsigned char *skb_pull(struct sk_buff *skb, unsigned int len)
 {
 	return skb_pull_inline(skb, len);
@@ -1163,8 +1097,9 @@ EXPORT_SYMBOL(skb_pull);
  *	Cut the length of a buffer down by removing data from the tail. If
  *	the buffer is already under the length specified it is not modified.
  *	The skb must be linear.
- */
-void skb_trim(struct sk_buff *skb, unsigned int len)
+ *///skb_trim与skb_add_data想对应，一个是删除一部分尾部数据，一个是向尾部追加数据。他们都只是对线性数据进行处理。pskb_trim还可以对非线性分散聚合I/O数据进行裁剪
+ //该函数指对线性数据空间进行尾部清除操作。如果需要对skb_shinfo做清除处理，则用pskb_trim函数，见樊东东P44
+void skb_trim(struct sk_buff *skb, unsigned int len) //skb_trim与skb_add_data想对应，一个是删除一部分尾部数据，一个是向尾部追加数据
 {
 	if (skb->len > len)
 		__skb_trim(skb, len);
@@ -1173,7 +1108,7 @@ EXPORT_SYMBOL(skb_trim);
 
 /* Trims skb to length len. It can change skb pointers.
  */
-
+//可以删除data区的数据，还可以删除分片区的数据
 int ___pskb_trim(struct sk_buff *skb, unsigned int len)
 {
 	struct sk_buff **fragp;
@@ -1192,22 +1127,22 @@ int ___pskb_trim(struct sk_buff *skb, unsigned int len)
 		goto drop_pages;
 
 	for (; i < nfrags; i++) {
-		int end = offset + skb_frag_size(&skb_shinfo(skb)->frags[i]);
+		int end = offset + skb_shinfo(skb)->frags[i].size;
 
 		if (end < len) {
 			offset = end;
 			continue;
 		}
 
-		skb_frag_size_set(&skb_shinfo(skb)->frags[i++], len - offset);
+		skb_shinfo(skb)->frags[i++].size = len - offset;
 
 drop_pages:
 		skb_shinfo(skb)->nr_frags = i;
 
 		for (; i < nfrags; i++)
-			skb_frag_unref(skb, i);
+			put_page(skb_shinfo(skb)->frags[i].page);
 
-		if (skb_has_frag_list(skb))
+		if (skb_has_frags(skb))
 			skb_drop_fraglist(skb);
 		goto done;
 	}
@@ -1281,7 +1216,8 @@ EXPORT_SYMBOL(___pskb_trim);
  * 2. It may change skb pointers.
  *
  * It is pretty complicated. Luckily, it is called only in exceptional cases.
- */
+ */ //把SKB中的分散聚合I/O中的数据线性化，保证分散聚合I/O中的数据和线性区的数据放在一起
+ //实际上是分配一个大的线性区域，把之前的线性区和分散聚合I/O数据拷贝过去
 unsigned char *__pskb_pull_tail(struct sk_buff *skb, int delta)
 {
 	/* If skb has not enough free space at tail, get new one
@@ -1292,27 +1228,28 @@ unsigned char *__pskb_pull_tail(struct sk_buff *skb, int delta)
 
 	if (eat > 0 || skb_cloned(skb)) {
 		if (pskb_expand_head(skb, 0, eat > 0 ? eat + 128 : 0,
-				     GFP_ATOMIC))
+				     GFP_ATOMIC)) //扩展线性缓冲区长度，保证下面的skb_copy_bits拷贝数据，内存空间够
 			return NULL;
 	}
 
-	if (skb_copy_bits(skb, skb_headlen(skb), skb_tail_pointer(skb), delta))
+	if (skb_copy_bits(skb, skb_headlen(skb), skb_tail_pointer(skb), delta)) //注意这里线性区和分散聚合I/O区的数据都拷贝了
 		BUG();
 
+    //由于数据已经拷贝到了skb->data中，因此需要释放frags,frag_list中被拷贝过的数据  
+    //计算从frags数组中拷贝的数据量  
+    
 	/* Optimization: no fragments, no reasons to preestimate
 	 * size of pulled pages. Superb.
 	 */
-	if (!skb_has_frag_list(skb))
+	if (!skb_has_frags(skb))
 		goto pull_pages;
 
 	/* Estimate size of pulled pages. */
 	eat = delta;
 	for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
-		int size = skb_frag_size(&skb_shinfo(skb)->frags[i]);
-
-		if (size >= eat)
-			goto pull_pages;
-		eat -= size;
+		if (skb_shinfo(skb)->frags[i].size >= eat)//寻找到满足eat这么多数据量的最后一个page  
+			goto pull_pages;//在frags数组中的数据量可以满足delta时，则只释放frags即可  
+		eat -= skb_shinfo(skb)->frags[i].size;
 	}
 
 	/* If we need update frag list, we are in troubles.
@@ -1321,7 +1258,7 @@ unsigned char *__pskb_pull_tail(struct sk_buff *skb, int delta)
 	 * be very rare operation, it is worth to fight against
 	 * further bloating skb head and crucify ourselves here instead.
 	 * Pure masohism, indeed. 8)8)
-	 */
+	 */ //eat仍不为0，说明从frag_list中进行了拷贝，释放frag_list  
 	if (eat) {
 		struct sk_buff *list = skb_shinfo(skb)->frag_list;
 		struct sk_buff *clone = NULL;
@@ -1330,61 +1267,63 @@ unsigned char *__pskb_pull_tail(struct sk_buff *skb, int delta)
 		do {
 			BUG_ON(!list);
 
-			if (list->len <= eat) {
+			if (list->len <= eat) {//当前skb的长度小于需要的长度  
 				/* Eaten as whole. */
-				eat -= list->len;
-				list = list->next;
-				insp = list;
+				eat -= list->len;//找到下一个skb  
+				list = list->next;//list指向下一个需要的skb  
+				insp = list;//insp指向当前的skb  
 			} else {
 				/* Eaten partially. */
-
-				if (skb_shared(list)) {
+                //此时insp指向前一个skb  
+                //说明当前skb可以满足需要的数据量   
+				if (skb_shared(list)) {//但是当前skb被共享  
 					/* Sucks! We need to fork list. :-( */
-					clone = skb_clone(list, GFP_ATOMIC);
+					clone = skb_clone(list, GFP_ATOMIC);//对最后那个拷贝不完全的skb，进行克隆 
 					if (!clone)
 						return NULL;
+					//list指向当前被克隆的的skb  
+                    //insp指向下一个skb   
 					insp = list->next;
 					list = clone;
 				} else {
 					/* This may be pulled without
 					 * problems. */
-					insp = list;
+					insp = list;//list与insp指向当前的skb  
 				}
-				if (!pskb_pull(list, eat)) {
+				if (!pskb_pull(list, eat)) {//修改最后一个skb，移动指针，删除掉被拷贝的数据  
 					kfree_skb(clone);
 					return NULL;
 				}
 				break;
 			}
 		} while (eat);
-
+        //list指向frag_list头  
+        //直到list遍历到数据量足够的最后一个skb   
 		/* Free pulled out fragments. */
 		while ((list = skb_shinfo(skb)->frag_list) != insp) {
 			skb_shinfo(skb)->frag_list = list->next;
-			kfree_skb(list);
+			kfree_skb(list);//递减当前skb的引用技术，如果引用计数=0，则释放list  
 		}
 		/* And insert new clone at head. */
-		if (clone) {
+		if (clone) {//说明最后一个skb只被拷贝了一部分，将此skb挂到frag_list头  
 			clone->next = list;
 			skb_shinfo(skb)->frag_list = clone;
 		}
 	}
 	/* Success! Now we may commit changes to skb data. */
 
-pull_pages:
+pull_pages://释放frags中的page  
 	eat = delta;
 	k = 0;
 	for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
-		int size = skb_frag_size(&skb_shinfo(skb)->frags[i]);
-
-		if (size <= eat) {
-			skb_frag_unref(skb, i);
-			eat -= size;
+		if (skb_shinfo(skb)->frags[i].size <= eat) {
+			put_page(skb_shinfo(skb)->frags[i].page);
+			eat -= skb_shinfo(skb)->frags[i].size;
 		} else {
 			skb_shinfo(skb)->frags[k] = skb_shinfo(skb)->frags[i];
 			if (eat) {
 				skb_shinfo(skb)->frags[k].page_offset += eat;
-				skb_frag_size_sub(&skb_shinfo(skb)->frags[k], eat);
+				skb_shinfo(skb)->frags[k].size -= eat;
 				eat = 0;
 			}
 			k++;
@@ -1399,21 +1338,9 @@ pull_pages:
 }
 EXPORT_SYMBOL(__pskb_pull_tail);
 
-/**
- *	skb_copy_bits - copy bits from skb to kernel buffer
- *	@skb: source skb
- *	@offset: offset in source
- *	@to: destination buffer
- *	@len: number of bytes to copy
- *
- *	Copy the specified number of bytes from the source skb to the
- *	destination buffer.
- *
- *	CAUTION ! :
- *		If its prototype is ever changed,
- *		check arch/{*}/net/{*}.S files,
- *		since it is called from BPF assembly code.
- */
+/* Copy some data bits from skb to kernel buffer. */
+//memcpy(to, skb->data + offset, len);从SKB的data处拷贝len字节数据到to缓冲区
+//将skb中起始offset的内容拷贝到to中，拷贝长度为len 。拷贝线性区和分散聚合I/O区的数据一起放到线性缓冲区。
 int skb_copy_bits(const struct sk_buff *skb, int offset, void *to, int len)
 {
 	int start = skb_headlen(skb);
@@ -1424,7 +1351,7 @@ int skb_copy_bits(const struct sk_buff *skb, int offset, void *to, int len)
 		goto fault;
 
 	/* Copy header. */
-	if ((copy = start - offset) > 0) {
+	if ((copy = start - offset) > 0) {// 拷贝在当前页面中的部分
 		if (copy > len)
 			copy = len;
 		skb_copy_from_linear_data_offset(skb, offset, to, copy);
@@ -1434,23 +1361,23 @@ int skb_copy_bits(const struct sk_buff *skb, int offset, void *to, int len)
 		to     += copy;
 	}
 
-	for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
+	for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {// 拷贝本skb中其他碎片中的部分
 		int end;
 
 		WARN_ON(start > offset + len);
 
-		end = start + skb_frag_size(&skb_shinfo(skb)->frags[i]);
+		end = start + skb_shinfo(skb)->frags[i].size;
 		if ((copy = end - offset) > 0) {
 			u8 *vaddr;
 
 			if (copy > len)
 				copy = len;
 
-			vaddr = kmap_skb_frag(&skb_shinfo(skb)->frags[i]);
+			vaddr = kmap_skb_frag(&skb_shinfo(skb)->frags[i]);//映射skb的frag到内核地址空间  
 			memcpy(to,
 			       vaddr + skb_shinfo(skb)->frags[i].page_offset+
-			       offset - start, copy);
-			kunmap_skb_frag(vaddr);
+			       offset - start, copy);//拷贝  
+			kunmap_skb_frag(vaddr);//解除映射  
 
 			if ((len -= copy) == 0)
 				return 0;
@@ -1460,7 +1387,7 @@ int skb_copy_bits(const struct sk_buff *skb, int offset, void *to, int len)
 		start = end;
 	}
 
-	skb_walk_frags(skb, frag_iter) {
+	skb_walk_frags(skb, frag_iter) {// 拷贝其他碎片skb中的数据部分
 		int end;
 
 		WARN_ON(start > offset + len);
@@ -1478,7 +1405,6 @@ int skb_copy_bits(const struct sk_buff *skb, int offset, void *to, int len)
 		}
 		start = end;
 	}
-
 	if (!len)
 		return 0;
 
@@ -1637,8 +1563,7 @@ static int __skb_splice_bits(struct sk_buff *skb, struct pipe_inode_info *pipe,
 	for (seg = 0; seg < skb_shinfo(skb)->nr_frags; seg++) {
 		const skb_frag_t *f = &skb_shinfo(skb)->frags[seg];
 
-		if (__splice_segment(skb_frag_page(f),
-				     f->page_offset, skb_frag_size(f),
+		if (__splice_segment(f->page, f->page_offset, f->size,
 				     offset, len, skb, spd, 0, sk, pipe))
 			return 1;
 	}
@@ -1748,7 +1673,7 @@ int skb_store_bits(struct sk_buff *skb, int offset, const void *from, int len)
 
 		WARN_ON(start > offset + len);
 
-		end = start + skb_frag_size(frag);
+		end = start + frag->size;
 		if ((copy = end - offset) > 0) {
 			u8 *vaddr;
 
@@ -1821,7 +1746,7 @@ __wsum skb_checksum(const struct sk_buff *skb, int offset,
 
 		WARN_ON(start > offset + len);
 
-		end = start + skb_frag_size(&skb_shinfo(skb)->frags[i]);
+		end = start + skb_shinfo(skb)->frags[i].size;
 		if ((copy = end - offset) > 0) {
 			__wsum csum2;
 			u8 *vaddr;
@@ -1896,7 +1821,7 @@ __wsum skb_copy_and_csum_bits(const struct sk_buff *skb, int offset,
 
 		WARN_ON(start > offset + len);
 
-		end = start + skb_frag_size(&skb_shinfo(skb)->frags[i]);
+		end = start + skb_shinfo(skb)->frags[i].size;
 		if ((copy = end - offset) > 0) {
 			__wsum csum2;
 			u8 *vaddr;
@@ -1953,7 +1878,7 @@ void skb_copy_and_csum_dev(const struct sk_buff *skb, u8 *to)
 	long csstart;
 
 	if (skb->ip_summed == CHECKSUM_PARTIAL)
-		csstart = skb_checksum_start_offset(skb);
+		csstart = skb->csum_start - skb_headroom(skb);
 	else
 		csstart = skb_headlen(skb);
 
@@ -1982,7 +1907,7 @@ EXPORT_SYMBOL(skb_copy_and_csum_dev);
  *	may be used safely with other locking list functions. The head item is
  *	returned or %NULL if the list is empty.
  */
-
+    //从list队列取出头部skb
 struct sk_buff *skb_dequeue(struct sk_buff_head *list)
 {
 	unsigned long flags;
@@ -2022,7 +1947,7 @@ EXPORT_SYMBOL(skb_dequeue_tail);
  *	Delete all buffers on an &sk_buff list. Each buffer is removed from
  *	the list and one reference dropped. This function takes the list
  *	lock and is atomic with respect to other list locking functions.
- */
+ *///情况链表中的所有SKB，并释放其中的空间
 void skb_queue_purge(struct sk_buff_head *list)
 {
 	struct sk_buff *skb;
@@ -2169,7 +2094,7 @@ static inline void skb_split_no_header(struct sk_buff *skb,
 	skb->data_len		  = len - pos;
 
 	for (i = 0; i < nfrags; i++) {
-		int size = skb_frag_size(&skb_shinfo(skb)->frags[i]);
+		int size = skb_shinfo(skb)->frags[i].size;
 
 		if (pos + size > len) {
 			skb_shinfo(skb1)->frags[k] = skb_shinfo(skb)->frags[i];
@@ -2183,10 +2108,10 @@ static inline void skb_split_no_header(struct sk_buff *skb,
 				 *    where splitting is expensive.
 				 * 2. Split is accurately. We make this.
 				 */
-				skb_frag_ref(skb, i);
+				get_page(skb_shinfo(skb)->frags[i].page);
 				skb_shinfo(skb1)->frags[0].page_offset += len - pos;
-				skb_frag_size_sub(&skb_shinfo(skb1)->frags[0], len - pos);
-				skb_frag_size_set(&skb_shinfo(skb)->frags[i], len - pos);
+				skb_shinfo(skb1)->frags[0].size -= len - pos;
+				skb_shinfo(skb)->frags[i].size	= len - pos;
 				skb_shinfo(skb)->nr_frags++;
 			}
 			k++;
@@ -2202,15 +2127,31 @@ static inline void skb_split_no_header(struct sk_buff *skb,
  * @skb: the buffer to split
  * @skb1: the buffer to receive the second part
  * @len: new length for skb
- */
+ *///skb为待拆分的skb,skb1为拆分后产生的新skb，len为源skb拆分后留下的数据长度  参考44页码
+ //当拆分数据的长度小于data区长度时，直接拆分data区即可，也就是如果源skb中的数据区长度大于len，则源skb中剩下的skb长度为数据区前面的len字节。
+ //如果len大于数据区长度。则skb中最后的数据为线性data区数据，还会有一部分分片区数据，分片中剩下的是第一个frags中的分片数据剩余部分  
+ //参考图3-29   45页码
+/*
+  * skb_split()可根据指定长度拆分SKB，使得原SKB中的数据长度
+  * 为指定的长度，而剩下的数据则保存到拆分得到的
+  * SKB中。
+  * 由于SKB中支持线性存储和聚合分散I/O存储，因此
+  * 在拆分过程中需要考虑这些情况。当拆分数据
+  * 的长度小于线性数据长度时比较容易处理，直接拆分
+  * 线性数据区即可。
+  * 参数skb为待拆分的SKB，skb1为拆分得到的SKB，len为
+  * 拆分后原SKB中数据的长度。
+  * 若拆分数据的长度大于线性数据长度，则需要拆分
+  * 非线性区域中的数据
+  */
 void skb_split(struct sk_buff *skb, struct sk_buff *skb1, const u32 len)
 {
-	int pos = skb_headlen(skb);
+	int pos = skb_headlen(skb);//线性缓冲区的长度
 
-	if (len < pos)	/* Split line is inside header. */
-		skb_split_inside_header(skb, skb1, len, pos);
+	if (len < pos)	/* Split line is inside header. */ 
+		skb_split_inside_header(skb, skb1, len, pos);//从skb的线性缓冲区中拆分pos-len字节到skb1的线性缓冲区中见樊东东上P44P45
 	else		/* Second chunk has no header, nothing to copy. */
-		skb_split_no_header(skb, skb1, len, pos);
+		skb_split_no_header(skb, skb1, len, pos); //从skb分散聚合I/O页中拆分一部分到skb1中 见樊东东上P44P45
 }
 EXPORT_SYMBOL(skb_split);
 
@@ -2230,7 +2171,7 @@ static int skb_prepare_for_shift(struct sk_buff *skb)
  * @shiftlen: shift up to this many bytes
  *
  * Attempts to shift up to shiftlen worth of bytes, which may be less than
- * the length of the skb, from skb to tgt. Returns number bytes shifted.
+ * the length of the skb, from tgt to skb. Returns number bytes shifted.
  * It's up to caller to free skb if everything was shifted.
  *
  * If @tgt runs out of frags, the whole operation is aborted.
@@ -2258,13 +2199,12 @@ int skb_shift(struct sk_buff *tgt, struct sk_buff *skb, int shiftlen)
 	 * commit all, so that we don't have to undo partial changes
 	 */
 	if (!to ||
-	    !skb_can_coalesce(tgt, to, skb_frag_page(fragfrom),
-			      fragfrom->page_offset)) {
+	    !skb_can_coalesce(tgt, to, fragfrom->page, fragfrom->page_offset)) {
 		merge = -1;
 	} else {
 		merge = to - 1;
 
-		todo -= skb_frag_size(fragfrom);
+		todo -= fragfrom->size;
 		if (todo < 0) {
 			if (skb_prepare_for_shift(skb) ||
 			    skb_prepare_for_shift(tgt))
@@ -2274,8 +2214,8 @@ int skb_shift(struct sk_buff *tgt, struct sk_buff *skb, int shiftlen)
 			fragfrom = &skb_shinfo(skb)->frags[from];
 			fragto = &skb_shinfo(tgt)->frags[merge];
 
-			skb_frag_size_add(fragto, shiftlen);
-			skb_frag_size_sub(fragfrom, shiftlen);
+			fragto->size += shiftlen;
+			fragfrom->size -= shiftlen;
 			fragfrom->page_offset += shiftlen;
 
 			goto onlymerged;
@@ -2299,20 +2239,20 @@ int skb_shift(struct sk_buff *tgt, struct sk_buff *skb, int shiftlen)
 		fragfrom = &skb_shinfo(skb)->frags[from];
 		fragto = &skb_shinfo(tgt)->frags[to];
 
-		if (todo >= skb_frag_size(fragfrom)) {
+		if (todo >= fragfrom->size) {
 			*fragto = *fragfrom;
-			todo -= skb_frag_size(fragfrom);
+			todo -= fragfrom->size;
 			from++;
 			to++;
 
 		} else {
-			__skb_frag_ref(fragfrom);
+			get_page(fragfrom->page);
 			fragto->page = fragfrom->page;
 			fragto->page_offset = fragfrom->page_offset;
-			skb_frag_size_set(fragto, todo);
+			fragto->size = todo;
 
 			fragfrom->page_offset += todo;
-			skb_frag_size_sub(fragfrom, todo);
+			fragfrom->size -= todo;
 			todo = 0;
 
 			to++;
@@ -2327,8 +2267,8 @@ int skb_shift(struct sk_buff *tgt, struct sk_buff *skb, int shiftlen)
 		fragfrom = &skb_shinfo(skb)->frags[0];
 		fragto = &skb_shinfo(tgt)->frags[merge];
 
-		skb_frag_size_add(fragto, skb_frag_size(fragfrom));
-		__skb_frag_unref(fragfrom);
+		fragto->size += fragfrom->size;
+		put_page(fragfrom->page);
 	}
 
 	/* Reposition in the original skb */
@@ -2395,7 +2335,7 @@ EXPORT_SYMBOL(skb_prepare_seq_read);
  * of bytes already consumed and the next call to
  * skb_seq_read() will return the remaining part of the block.
  *
- * Note 1: The size of each block of data returned can be arbitrary,
+ * Note 1: The size of each block of data returned can be arbitary,
  *       this limitation is the cost for zerocopy seqeuental
  *       reads of potentially non linear data.
  *
@@ -2425,7 +2365,7 @@ next_skb:
 
 	while (st->frag_idx < skb_shinfo(st->cur_skb)->nr_frags) {
 		frag = &skb_shinfo(st->cur_skb)->frags[st->frag_idx];
-		block_limit = skb_frag_size(frag) + st->stepped_offset;
+		block_limit = frag->size + st->stepped_offset;
 
 		if (abs_offset < block_limit) {
 			if (!st->frag_data)
@@ -2443,7 +2383,7 @@ next_skb:
 		}
 
 		st->frag_idx++;
-		st->stepped_offset += skb_frag_size(frag);
+		st->stepped_offset += frag->size;
 	}
 
 	if (st->frag_data) {
@@ -2451,7 +2391,7 @@ next_skb:
 		st->frag_data = NULL;
 	}
 
-	if (st->root_skb == st->cur_skb && skb_has_frag_list(st->root_skb)) {
+	if (st->root_skb == st->cur_skb && skb_has_frags(st->root_skb)) {
 		st->cur_skb = skb_shinfo(st->root_skb)->frag_list;
 		st->frag_idx = 0;
 		goto next_skb;
@@ -2561,6 +2501,8 @@ int skb_append_datato_frags(struct sock *sk, struct sk_buff *skb,
 			return -ENOMEM;
 
 		/* initialize the next frag */
+		sk->sk_sndmsg_page = page;
+		sk->sk_sndmsg_off = 0;
 		skb_fill_page_desc(skb, frg_cnt, page, 0, 0);
 		skb->truesize += PAGE_SIZE;
 		atomic_add(PAGE_SIZE, &sk->sk_wmem_alloc);
@@ -2573,13 +2515,15 @@ int skb_append_datato_frags(struct sock *sk, struct sk_buff *skb,
 		left = PAGE_SIZE - frag->page_offset;
 		copy = (length > left)? left : length;
 
-		ret = getfrag(from, skb_frag_address(frag) + skb_frag_size(frag),
+		ret = getfrag(from, (page_address(frag->page) +
+			    frag->page_offset + frag->size),
 			    offset, copy, 0, skb);
 		if (ret < 0)
 			return -EFAULT;
 
 		/* copy was successful so update the size parameters */
-		skb_frag_size_add(frag, copy);
+		sk->sk_sndmsg_off += copy;
+		frag->size += copy;
 		skb->len += copy;
 		skb->data_len += copy;
 		offset += copy;
@@ -2610,6 +2554,7 @@ unsigned char *skb_pull_rcsum(struct sk_buff *skb, unsigned int len)
 	skb_postpull_rcsum(skb, skb->data, len);
 	return skb->data += len;
 }
+
 EXPORT_SYMBOL_GPL(skb_pull_rcsum);
 
 /**
@@ -2621,7 +2566,7 @@ EXPORT_SYMBOL_GPL(skb_pull_rcsum);
  *	a pointer to the first in a list of new skbs for the segments.
  *	In case of error it returns ERR_PTR(err).
  */
-struct sk_buff *skb_segment(struct sk_buff *skb, u32 features)
+struct sk_buff *skb_segment(struct sk_buff *skb, int features)
 {
 	struct sk_buff *segs = NULL;
 	struct sk_buff *tail = NULL;
@@ -2631,7 +2576,7 @@ struct sk_buff *skb_segment(struct sk_buff *skb, u32 features)
 	unsigned int offset = doffset;
 	unsigned int headroom;
 	unsigned int len;
-	int sg = !!(features & NETIF_F_SG);
+	int sg = features & NETIF_F_SG;
 	int nfrags = skb_shinfo(skb)->nr_frags;
 	int err = -ENOMEM;
 	int i = 0;
@@ -2725,12 +2670,12 @@ struct sk_buff *skb_segment(struct sk_buff *skb, u32 features)
 
 		while (pos < offset + len && i < nfrags) {
 			*frag = skb_shinfo(skb)->frags[i];
-			__skb_frag_ref(frag);
-			size = skb_frag_size(frag);
+			get_page(frag->page);
+			size = frag->size;
 
 			if (pos < offset) {
 				frag->page_offset += offset - pos;
-				skb_frag_size_sub(frag, offset - pos);
+				frag->size -= offset - pos;
 			}
 
 			skb_shinfo(nskb)->nr_frags++;
@@ -2739,7 +2684,7 @@ struct sk_buff *skb_segment(struct sk_buff *skb, u32 features)
 				i++;
 				pos += size;
 			} else {
-				skb_frag_size_sub(frag, pos + size - (offset + len));
+				frag->size -= pos + size - (offset + len);
 				goto skip_fraglist;
 			}
 
@@ -2819,7 +2764,7 @@ int skb_gro_receive(struct sk_buff **head, struct sk_buff *skb)
 		} while (--i);
 
 		frag->page_offset += offset;
-		skb_frag_size_sub(frag, offset);
+		frag->size -= offset;
 
 		skb->truesize -= skb->data_len;
 		skb->len -= skb->data_len;
@@ -2868,12 +2813,8 @@ int skb_gro_receive(struct sk_buff **head, struct sk_buff *skb)
 
 merge:
 	if (offset > headlen) {
-		unsigned int eat = offset - headlen;
-
-		skbinfo->frags[0].page_offset += eat;
-		skb_frag_size_sub(&skbinfo->frags[0], eat);
-		skb->data_len -= eat;
-		skb->len -= eat;
+		skbinfo->frags[0].page_offset += offset - headlen;
+		skbinfo->frags[0].size -= offset - headlen;
 		offset = headlen;
 	}
 
@@ -2902,7 +2843,7 @@ void __init skb_init(void)
 					      SLAB_HWCACHE_ALIGN|SLAB_PANIC,
 					      NULL);
 	skbuff_fclone_cache = kmem_cache_create("skbuff_fclone_cache",
-						(2*sizeof(struct sk_buff)) +
+						(2*sizeof(struct sk_buff)) +       //这里加了个sizeof(atomic_t)的原因是，用这个来表示引用计数，参考skb_clone
 						sizeof(atomic_t),
 						0,
 						SLAB_HWCACHE_ALIGN|SLAB_PANIC,
@@ -2942,13 +2883,13 @@ __skb_to_sgvec(struct sk_buff *skb, struct scatterlist *sg, int offset, int len)
 
 		WARN_ON(start > offset + len);
 
-		end = start + skb_frag_size(&skb_shinfo(skb)->frags[i]);
+		end = start + skb_shinfo(skb)->frags[i].size;
 		if ((copy = end - offset) > 0) {
 			skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
 
 			if (copy > len)
 				copy = len;
-			sg_set_page(&sg[elt], skb_frag_page(frag), copy,
+			sg_set_page(&sg[elt], frag->page, copy,
 					frag->page_offset+offset-start);
 			elt++;
 			if (!(len -= copy))
@@ -3021,7 +2962,7 @@ int skb_cow_data(struct sk_buff *skb, int tailbits, struct sk_buff **trailer)
 		return -ENOMEM;
 
 	/* Easy case. Most of packets will go this way. */
-	if (!skb_has_frag_list(skb)) {
+	if (!skb_has_frags(skb)) {
 		/* A little of trouble, not enough of space for trailer.
 		 * This should not happen, when stack is tuned to generate
 		 * good frames. OK, on miss we reallocate and reserve even more
@@ -3056,7 +2997,7 @@ int skb_cow_data(struct sk_buff *skb, int tailbits, struct sk_buff **trailer)
 
 		if (skb1->next == NULL && tailbits) {
 			if (skb_shinfo(skb1)->nr_frags ||
-			    skb_has_frag_list(skb1) ||
+			    skb_has_frags(skb1) ||
 			    skb_tailroom(skb1) < tailbits)
 				ntail = tailbits + 128;
 		}
@@ -3065,7 +3006,7 @@ int skb_cow_data(struct sk_buff *skb, int tailbits, struct sk_buff **trailer)
 		    skb_cloned(skb1) ||
 		    ntail ||
 		    skb_shinfo(skb1)->nr_frags ||
-		    skb_has_frag_list(skb1)) {
+		    skb_has_frags(skb1)) {
 			struct sk_buff *skb2;
 
 			/* Fuck, we are miserable poor guys... */
@@ -3120,9 +3061,6 @@ int sock_queue_err_skb(struct sock *sk, struct sk_buff *skb)
 	skb->destructor = sock_rmem_free;
 	atomic_add(skb->truesize, &sk->sk_rmem_alloc);
 
-	/* before exiting rcu section, make sure dst is refcounted */
-	skb_dst_force(skb);
-
 	skb_queue_tail(&sk->sk_error_queue, skb);
 	if (!sock_flag(sk, SOCK_DEAD))
 		sk->sk_data_ready(sk, skb->len);
@@ -3151,7 +3089,7 @@ void skb_tstamp_tx(struct sk_buff *orig_skb,
 	} else {
 		/*
 		 * no hardware time stamps available,
-		 * so keep the shared tx_flags and only
+		 * so keep the skb_shared_tx and only
 		 * store software time stamp
 		 */
 		skb->tstamp = ktime_get_real();

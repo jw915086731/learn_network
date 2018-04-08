@@ -34,16 +34,14 @@
  *	Save time not doing access_ok. copy_*_user will make this work
  *	in any case.
  */
-
+//获取应用层sendmsg发送过来的实际msg_name和iov
 int verify_iovec(struct msghdr *m, struct iovec *iov, struct sockaddr *address, int mode)
 {
-	int size, ct, err;
+	int size, err, ct;
 
 	if (m->msg_namelen) {
 		if (mode == VERIFY_READ) {
-			void __user *namep;
-			namep = (void __user __force *) m->msg_name;
-			err = move_addr_to_kernel(namep, m->msg_namelen,
+			err = move_addr_to_kernel(m->msg_name, m->msg_namelen,
 						  address);
 			if (err < 0)
 				return err;
@@ -54,10 +52,10 @@ int verify_iovec(struct msghdr *m, struct iovec *iov, struct sockaddr *address, 
 	}
 
 	size = m->msg_iovlen * sizeof(struct iovec);
-	if (copy_from_user(iov, (void __user __force *) m->msg_iov, size))
+	if (copy_from_user(iov, m->msg_iov, size))//用户控件msg_iov拷贝到内核iov中
 		return -EFAULT;
 
-	m->msg_iov = iov;
+	m->msg_iov = iov;//msg_iov指向内核iov了
 	err = 0;
 
 	for (ct = 0; ct < m->msg_iovlen; ct++) {
@@ -78,7 +76,7 @@ int verify_iovec(struct msghdr *m, struct iovec *iov, struct sockaddr *address, 
  *
  *	Note: this modifies the original iovec.
  */
-
+//将内核空间中数据复制到用户空间的由iovec结构变量描述的缓冲区中，该函数被skb_copy_datagram_iovec调用
 int memcpy_toiovec(struct iovec *iov, unsigned char *kdata, int len)
 {
 	while (len > 0) {
@@ -96,7 +94,6 @@ int memcpy_toiovec(struct iovec *iov, unsigned char *kdata, int len)
 
 	return 0;
 }
-EXPORT_SYMBOL(memcpy_toiovec);
 
 /*
  *	Copy kernel to iovec. Returns -EFAULT on error.
@@ -122,14 +119,13 @@ int memcpy_toiovecend(const struct iovec *iov, unsigned char *kdata,
 
 	return 0;
 }
-EXPORT_SYMBOL(memcpy_toiovecend);
 
 /*
  *	Copy iovec to kernel. Returns -EFAULT on error.
  *
  *	Note: this modifies the original iovec.
  */
-
+//讲用户空间iovec结构变量描述的缓冲区复制到内核空间
 int memcpy_fromiovec(unsigned char *kdata, struct iovec *iov, int len)
 {
 	while (len > 0) {
@@ -147,12 +143,12 @@ int memcpy_fromiovec(unsigned char *kdata, struct iovec *iov, int len)
 
 	return 0;
 }
-EXPORT_SYMBOL(memcpy_fromiovec);
 
 /*
  *	Copy iovec from kernel. Returns -EFAULT on error.
  */
-
+//讲用户空间iovec结构描述的缓冲区中的信息从offset偏移处开始复制，复制到内核空间，和memcpy_fromiovec的区别在于多了个offset偏移，相当于memcpy_fromiovec
+//的偏移量为0
 int memcpy_fromiovecend(unsigned char *kdata, const struct iovec *iov,
 			int offset, int len)
 {
@@ -176,7 +172,6 @@ int memcpy_fromiovecend(unsigned char *kdata, const struct iovec *iov,
 
 	return 0;
 }
-EXPORT_SYMBOL(memcpy_fromiovecend);
 
 /*
  *	And now for the all-in-one: copy and checksum from a user iovec
@@ -185,7 +180,7 @@ EXPORT_SYMBOL(memcpy_fromiovecend);
  *
  *	ip_build_xmit must ensure that when fragmenting only the last
  *	call to this function will be unaligned also.
- */
+ *///个memcpy_fromiovecend的功能类似，只是多了计算校验和功能
 int csum_partial_copy_fromiovecend(unsigned char *kdata, struct iovec *iov,
 				 int offset, unsigned int len, __wsum *csump)
 {
@@ -261,4 +256,9 @@ out_fault:
 	err = -EFAULT;
 	goto out;
 }
+
 EXPORT_SYMBOL(csum_partial_copy_fromiovecend);
+EXPORT_SYMBOL(memcpy_fromiovec);
+EXPORT_SYMBOL(memcpy_fromiovecend);
+EXPORT_SYMBOL(memcpy_toiovec);
+EXPORT_SYMBOL(memcpy_toiovecend);

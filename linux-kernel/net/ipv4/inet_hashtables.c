@@ -21,13 +21,16 @@
 
 #include <net/inet_connection_sock.h>
 #include <net/inet_hashtables.h>
-#include <net/secure_seq.h>
 #include <net/ip.h>
 
 /*
  * Allocate and initialize a new local port bind bucket.
  * The bindhash mutex for snum's hash chain must be held here.
  */
+ /*
+ * 用来在bind_bucket_cachep高速缓存中分配bind端口实例，
+ * 设置后将其添加到inet_bind_hashbucket散列表中
+ */ //cachep见tcp_hashinfo
 struct inet_bind_bucket *inet_bind_bucket_create(struct kmem_cache *cachep,
 						 struct net *net,
 						 struct inet_bind_hashbucket *head,
@@ -48,6 +51,8 @@ struct inet_bind_bucket *inet_bind_bucket_create(struct kmem_cache *cachep,
 
 /*
  * Caller must hold hashbucket lock for this tb with local BH disabled
+ *//*
+ * 将指定的bind端口实例从inet_bind_hashbucket散列表中删除并释放
  */
 void inet_bind_bucket_destroy(struct kmem_cache *cachep, struct inet_bind_bucket *tb)
 {
@@ -58,10 +63,11 @@ void inet_bind_bucket_destroy(struct kmem_cache *cachep, struct inet_bind_bucket
 	}
 }
 
+//将传输控制块与绑定端口信息关联，完成绑定。把tb与sk关联起来
 void inet_bind_hash(struct sock *sk, struct inet_bind_bucket *tb,
 		    const unsigned short snum)
 {
-	struct inet_hashinfo *hashinfo = sk->sk_prot->h.hashinfo;
+	struct inet_hashinfo *hashinfo = sk->sk_prot->h.hashinfo; //tcp 为tcp_hashinfo
 
 	atomic_inc(&hashinfo->bsockets);
 
@@ -100,45 +106,24 @@ void inet_put_port(struct sock *sk)
 	__inet_put_port(sk);
 	local_bh_enable();
 }
+
 EXPORT_SYMBOL(inet_put_port);
 
-int __inet_inherit_port(struct sock *sk, struct sock *child)
+void __inet_inherit_port(struct sock *sk, struct sock *child)
 {
 	struct inet_hashinfo *table = sk->sk_prot->h.hashinfo;
-	unsigned short port = inet_sk(child)->inet_num;
-	const int bhash = inet_bhashfn(sock_net(sk), port,
+	const int bhash = inet_bhashfn(sock_net(sk), inet_sk(child)->inet_num,
 			table->bhash_size);
 	struct inet_bind_hashbucket *head = &table->bhash[bhash];
 	struct inet_bind_bucket *tb;
 
 	spin_lock(&head->lock);
 	tb = inet_csk(sk)->icsk_bind_hash;
-	if (tb->port != port) {
-		/* NOTE: using tproxy and redirecting skbs to a proxy
-		 * on a different listener port breaks the assumption
-		 * that the listener socket's icsk_bind_hash is the same
-		 * as that of the child socket. We have to look up or
-		 * create a new bind bucket for the child here. */
-		struct hlist_node *node;
-		inet_bind_bucket_for_each(tb, node, &head->chain) {
-			if (net_eq(ib_net(tb), sock_net(sk)) &&
-			    tb->port == port)
-				break;
-		}
-		if (!node) {
-			tb = inet_bind_bucket_create(table->bind_bucket_cachep,
-						     sock_net(sk), head, port);
-			if (!tb) {
-				spin_unlock(&head->lock);
-				return -ENOMEM;
-			}
-		}
-	}
-	inet_bind_hash(child, tb, port);
+	sk_add_bind_node(child, &tb->owners);
+	inet_csk(child)->icsk_bind_hash = tb;
 	spin_unlock(&head->lock);
-
-	return 0;
 }
+
 EXPORT_SYMBOL_GPL(__inet_inherit_port);
 
 static inline int compute_score(struct sock *sk, struct net *net,
@@ -288,7 +273,11 @@ out:
 }
 EXPORT_SYMBOL_GPL(__inet_lookup_established);
 
-/* called with local bh disabled */
+/* called with local bh disabled 
+通过__inet_check_established()来检测该端口能否被复用，
+ * 动态绑定的端口只能复用在TIME_WAIT状态下绑定的端口，
+ * 当然还需要启用tcp_tw_reuse
+*/
 static int __inet_check_established(struct inet_timewait_death_row *death_row,
 				    struct sock *sk, __u16 lport,
 				    struct inet_timewait_sock **twp)
@@ -327,6 +316,10 @@ static int __inet_check_established(struct inet_timewait_death_row *death_row,
 	tw = NULL;
 
 	/* And established part... */
+	/*
+	 * head->chain指向的链表中存储的是除LISTEN和TIME-WAIT状态外的
+	 * 套接字，也就是说不仅只包括established状态。
+	 */
 	sk_nulls_for_each(sk2, node, &head->chain) {
 		if (INET_MATCH(sk2, net, hash, acookie,
 					saddr, daddr, ports, dif))
@@ -373,6 +366,8 @@ static inline u32 inet_sk_port_offset(const struct sock *sk)
 					  inet->inet_dport);
 }
 
+
+//把sk添加到tcp_hashinfo的ehash中
 int __inet_hash_nolisten(struct sock *sk, struct inet_timewait_sock *tw)
 {
 	struct inet_hashinfo *hashinfo = sk->sk_prot->h.hashinfo;
@@ -405,11 +400,12 @@ static void __inet_hash(struct sock *sk)
 	struct inet_hashinfo *hashinfo = sk->sk_prot->h.hashinfo;
 	struct inet_listen_hashbucket *ilb;
 
-	if (sk->sk_state != TCP_LISTEN) {
+	if (sk->sk_state != TCP_LISTEN) {  //把sk添加到tcp_hashinfo的ehash中
 		__inet_hash_nolisten(sk, NULL);
 		return;
 	}
 
+    //把sk添加到tcp_hashinfo的listening_hash中
 	WARN_ON(!sk_unhashed(sk));
 	ilb = &hashinfo->listening_hash[inet_sk_listen_hashfn(sk)];
 
@@ -419,6 +415,7 @@ static void __inet_hash(struct sock *sk)
 	spin_unlock(&ilb->lock);
 }
 
+////将该传输控制块socket添加到tcp_hashinfo的对应hash中
 void inet_hash(struct sock *sk)
 {
 	if (sk->sk_state != TCP_CLOSE) {
@@ -451,13 +448,23 @@ void inet_unhash(struct sock *sk)
 }
 EXPORT_SYMBOL_GPL(inet_unhash);
 
+/*从这个函数的实现可以看出，主要是由于可用的端口被占满了，所以找不到一个可用的端口，导致连接失败。
+运行netstat可以发现确实存在很多TIME_WAIT状态的socket，这些socket将可用端口占满了。
+[root@test miuistorage-dev]# netstat -n | awk '/^tcp/ {++state[$NF]} END {for(key in state) 
+print key,"\t",state[key]}'
+TIME_WAIT        26837
+ESTABLISHED      30 
+*/
+//参考:http://www.yunstorage.org/%E7%BD%91%E7%BB%9C%E7%BC%96%E7%A8%8B/socket-connect-error-99cannot-assign-requested-address/
+//如果快速回收TIME_WAIT状态的端口
 int __inet_hash_connect(struct inet_timewait_death_row *death_row,
 		struct sock *sk, u32 port_offset,
 		int (*check_established)(struct inet_timewait_death_row *,
 			struct sock *, __u16, struct inet_timewait_sock **),
 		int (*hash)(struct sock *sk, struct inet_timewait_sock *twp))
 {
-	struct inet_hashinfo *hinfo = death_row->hashinfo;
+    /* 通过tcp_death_row中的成员hashinfo，获取指向TCP中散列表管理器hashinfo。 */
+	struct inet_hashinfo *hinfo = death_row->hashinfo;//也就是tcp_hashinfo
 	const unsigned short snum = inet_sk(sk)->inet_num;
 	struct inet_bind_hashbucket *head;
 	struct inet_bind_bucket *tb;
@@ -465,7 +472,7 @@ int __inet_hash_connect(struct inet_timewait_death_row *death_row,
 	struct net *net = sock_net(sk);
 	int twrefcnt = 1;
 
-	if (!snum) {
+	if (!snum) {//如果是应用程序bind的时候指定了端口，则无需端口复用检查。
 		int i, remaining, low, high, port;
 		static u32 hint;
 		u32 offset = hint + port_offset;
@@ -477,16 +484,31 @@ int __inet_hash_connect(struct inet_timewait_death_row *death_row,
 
 		local_bh_disable();
 		for (i = 1; i <= remaining; i++) {
-			port = low + (i + offset) % remaining;
+		    /*
+			 * 在动态端口范围内，把通过源地址、目的地址和
+			 * 目的端口计算得到的值作为端口号初始值。offset从这里inet_sk_port_offset来
+			 */
+			port = low + (i + offset) % remaining; //
 			if (inet_is_reserved_local_port(port))
 				continue;
 			head = &hinfo->bhash[inet_bhashfn(net, port,
-					hinfo->bhash_size)];
+					hinfo->bhash_size)]; //bhash计算出的是key键值， head为找到的hash桶中的关键字表头
 			spin_lock(&head->lock);
 
 			/* Does not bother with rcv_saddr checks,
 			 * because the established check is already
 			 * unique enough.
+			 */
+			 /*
+			 * 在inet_bind_hashbucket散列表中查找该端口是否已被使用。
+			 * 如果已被使用，则需要检测能否被复用。
+			 * 在动态选择端口不允许复用通过bind系统调用绑定的
+			 * 端口，无论该端口能否被复用，都不能被复用，需
+			 * 重新选择。见应用层listen的时候，在内核中分配检查端口函数inet_csk_get_port
+			 * 通过__inet_check_established()来检测该端口能否被复用，
+			 * 动态绑定的端口只能复用在TIME_WAIT状态下绑定的端口，
+			 * 当然还需要启用tcp_tw_reuse。若通过检测，则跳转到
+			 * ok处进行绑定，否则递增端口号，继续下一轮确认。
 			 */
 			inet_bind_bucket_for_each(tb, node, &head->chain) {
 				if (net_eq(ib_net(tb), net) &&
@@ -495,12 +517,14 @@ int __inet_hash_connect(struct inet_timewait_death_row *death_row,
 						goto next_port;
 					WARN_ON(hlist_empty(&tb->owners));
 					if (!check_established(death_row, sk,
-								port, &tw))
+								port, &tw)) //这里调用的是__inet_check_established()函数
 						goto ok;
 					goto next_port;
 				}
 			}
-
+            /*
+			 * 如果该端口号未使用，则可使用该端口，为该端口创建信息块并将其添加到bhash散列表中。创建信息块失败，返回EADDRNOTAVAIL错误号。
+			 */
 			tb = inet_bind_bucket_create(hinfo->bind_bucket_cachep,
 					net, head, port);
 			if (!tb) {
@@ -521,15 +545,27 @@ ok:
 		hint += i;
 
 		/* Head lock still held and bh's disabled */
+		/*
+		 * 将传输控制块与绑定端口信息关联，完成绑定。
+		 */
 		inet_bind_hash(sk, tb, port);
+		/*
+		 * 如果该传输控制块未添加到或已脱离
+		 * ehash散列表，则需添加到该散列表中。
+		 */
 		if (sk_unhashed(sk)) {
 			inet_sk(sk)->inet_sport = htons(port);
-			twrefcnt += hash(sk, tw);
+			twrefcnt += hash(sk, tw);//这里调用的是__inet_hash_nolisten()函数
 		}
 		if (tw)
 			twrefcnt += inet_twsk_bind_unhash(tw, hinfo);
 		spin_unlock(&head->lock);
 
+        /*
+		 * 如果与一个TIME_WAIT状态的套接字复用该端口，
+		 * 则需删除释放该TIMEWAIT状态的套接字。绑定
+		 * 完成后返回。
+		 */
 		if (tw) {
 			inet_twsk_deschedule(tw, death_row);
 			while (twrefcnt) {
@@ -542,17 +578,24 @@ ok:
 		goto out;
 	}
 
+    /*
+	 * 对于已绑定端口的传输控制块和绑定信息块需要
+	 * 相应确认。确认绑定端口信息块与之相绑定的传
+	 * 输控制块是不是该传输控制块，该传输控制块指
+	 * 向绑定信息块的指针是否有效。不然需要重新通
+	 * 过__inet_check_established()来检测该端口能否被使用。
+	 */
 	head = &hinfo->bhash[inet_bhashfn(net, snum, hinfo->bhash_size)];
 	tb  = inet_csk(sk)->icsk_bind_hash;
 	spin_lock_bh(&head->lock);
 	if (sk_head(&tb->owners) == sk && !sk->sk_bind_node.next) {
-		hash(sk, NULL);
+		hash(sk, NULL);//这里调用的是__inet_hash_nolisten()函数
 		spin_unlock_bh(&head->lock);
 		return 0;
 	} else {
 		spin_unlock(&head->lock);
 		/* No definite answer... Walk to established hash table */
-		ret = check_established(death_row, sk, snum, NULL);
+		ret = check_established(death_row, sk, snum, NULL);//这里调用的是__inet_check_established()函数
 out:
 		local_bh_enable();
 		return ret;
@@ -562,12 +605,25 @@ out:
 /*
  * Bind a port for a connect operation and hash it.
  */
+ /*
+ * inet_hash_connect()主要用于在主动连接时动态绑定一个端口。
+ * 1)在动态端口范围内，从通过源地址、目的地址和目的端口
+ *    计算得到的偏移开始，确认一个可用的端口号
+ * 2)如果该端口已使用，则进而确定该端口是否能使用，不能
+ *    则递增端口号继续确认；能使用则可用端口已找到。
+ * 3)如果该端口未使用，则可使用该端口
+ * 4)最后完成绑定过程。
+ */ 
+ /* 动态绑定一个本地端口，并将传输控制块添加到ehash散列表中。由于在动态分配端口时，如果找到的是已使用的端口，则
+	 * 需在TIME_WAIT状态中进行相应的确认，因此调用inet_hash_connect()时需用timewait传输控制块和参数管理器tcp_death_row作为参数。*/
+ //这里面会把sk添加到ehash中，虽然连接还没建立起来。该函数外的tcp_connect才是真正发送SYN报文的地方
 int inet_hash_connect(struct inet_timewait_death_row *death_row,
 		      struct sock *sk)
 {
 	return __inet_hash_connect(death_row, sk, inet_sk_port_offset(sk),
 			__inet_check_established, __inet_hash_nolisten);
 }
+
 EXPORT_SYMBOL_GPL(inet_hash_connect);
 
 void inet_hashinfo_init(struct inet_hashinfo *h)
@@ -581,4 +637,5 @@ void inet_hashinfo_init(struct inet_hashinfo *h)
 				      i + LISTENING_NULLS_BASE);
 		}
 }
+
 EXPORT_SYMBOL_GPL(inet_hashinfo_init);

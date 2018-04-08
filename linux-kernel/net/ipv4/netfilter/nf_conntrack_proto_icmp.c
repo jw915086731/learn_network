@@ -160,7 +160,7 @@ icmp_error_message(struct net *net, struct nf_conn *tmpl, struct sk_buff *skb,
 	/* Update skb to refer to this connection */
 	skb->nfct = &nf_ct_tuplehash_to_ctrack(h)->ct_general;
 	skb->nfctinfo = *ctinfo;
-	return NF_ACCEPT;
+	return -NF_ACCEPT;
 }
 
 /* Small and modified version of icmp_rcv */
@@ -289,7 +289,8 @@ static struct ctl_table icmp_compat_sysctl_table[] = {
 #endif /* CONFIG_NF_CONNTRACK_PROC_COMPAT */
 #endif /* CONFIG_SYSCTL */
 
-struct nf_conntrack_l4proto nf_conntrack_l4proto_icmp __read_mostly =
+//struct nf_conntrack_l4proto nf_conntrack_l4proto_icmp __read_mostly =
+struct nf_conntrack_l4proto nf_conntrack_l4proto_icmp =
 {
 	.l3proto		= PF_INET,
 	.l4proto		= IPPROTO_ICMP,

@@ -19,7 +19,6 @@
 #include <linux/net.h>
 #include <net/ip.h>
 #include <net/inetpeer.h>
-#include <net/secure_seq.h>
 
 /*
  *  Theory of operations.
@@ -52,55 +51,49 @@
  *  lookups performed with disabled BHs.
  *
  *  Serialisation issues.
- *  1.  Nodes may appear in the tree only with the pool lock held.
- *  2.  Nodes may disappear from the tree only with the pool lock held
+ *  1.  Nodes may appear in the tree only with the pool write lock held.
+ *  2.  Nodes may disappear from the tree only with the pool write lock held
  *      AND reference count being 0.
- *  3.  Global variable peer_total is modified under the pool lock.
- *  4.  struct inet_peer fields modification:
+ *  3.  Nodes appears and disappears from unused node list only under
+ *      "inet_peer_unused_lock".
+ *  4.  Global variable peer_total is modified under the pool lock.
+ *  5.  struct inet_peer fields modification:
  *		avl_left, avl_right, avl_parent, avl_height: pool lock
+ *		unused: unused node list lock
  *		refcnt: atomically against modifications on other CPU;
  *		   usually under some other lock to prevent node disappearing
- *		daddr: unchangeable
- *		ip_id_count: atomic value (no lock needed)
+ *		dtime: unused node list lock
+ *		v4daddr: unchangeable
+ *		ip_id_count: idlock
  */
 
 static struct kmem_cache *peer_cachep __read_mostly;
 
 #define node_height(x) x->avl_height
-
-#define peer_avl_empty ((struct inet_peer *)&peer_fake_node)
-#define peer_avl_empty_rcu ((struct inet_peer __rcu __force *)&peer_fake_node)
-static const struct inet_peer peer_fake_node = {
-	.avl_left	= peer_avl_empty_rcu,
-	.avl_right	= peer_avl_empty_rcu,
+static struct inet_peer peer_fake_node = {
+	.avl_left	= &peer_fake_node,
+	.avl_right	= &peer_fake_node,
 	.avl_height	= 0
 };
-
-struct inet_peer_base {
-	struct inet_peer __rcu *root;
-	seqlock_t	lock;
-	int		total;
-};
-
-static struct inet_peer_base v4_peers = {
-	.root		= peer_avl_empty_rcu,
-	.lock		= __SEQLOCK_UNLOCKED(v4_peers.lock),
-	.total		= 0,
-};
-
-static struct inet_peer_base v6_peers = {
-	.root		= peer_avl_empty_rcu,
-	.lock		= __SEQLOCK_UNLOCKED(v6_peers.lock),
-	.total		= 0,
-};
-
+#define peer_avl_empty (&peer_fake_node)
+static struct inet_peer *peer_root = peer_avl_empty;
+static DEFINE_RWLOCK(peer_pool_lock);
 #define PEER_MAXDEPTH 40 /* sufficient for about 2^27 nodes */
 
+static int peer_total;
 /* Exported for sysctl_net_ipv4.  */
 int inet_peer_threshold __read_mostly = 65536 + 128;	/* start to throw entries more
 					 * aggressively at this stage */
 int inet_peer_minttl __read_mostly = 120 * HZ;	/* TTL under high load: 120 sec */
 int inet_peer_maxttl __read_mostly = 10 * 60 * HZ;	/* usual time to live: 10 min */
+int inet_peer_gc_mintime __read_mostly = 10 * HZ;
+int inet_peer_gc_maxtime __read_mostly = 120 * HZ;
+
+static LIST_HEAD(unused_peers);
+static DEFINE_SPINLOCK(inet_peer_unused_lock);
+
+static void peer_check_expire(unsigned long dummy);
+static DEFINE_TIMER(peer_periodic_timer, peer_check_expire, 0, 0);
 
 
 /* Called from ip_output.c:ip_init  */
@@ -123,178 +116,137 @@ void __init inet_initpeers(void)
 
 	peer_cachep = kmem_cache_create("inet_peer_cache",
 			sizeof(struct inet_peer),
-			0, SLAB_HWCACHE_ALIGN | SLAB_PANIC,
+			0, SLAB_HWCACHE_ALIGN|SLAB_PANIC,
 			NULL);
 
+	/* All the timers, started at system startup tend
+	   to synchronize. Perturb it a bit.
+	 */
+	peer_periodic_timer.expires = jiffies
+		+ net_random() % inet_peer_gc_maxtime
+		+ inet_peer_gc_maxtime;
+	add_timer(&peer_periodic_timer);
 }
 
-static int addr_compare(const struct inetpeer_addr *a,
-			const struct inetpeer_addr *b)
+/* Called with or without local BH being disabled. */
+static void unlink_from_unused(struct inet_peer *p)
 {
-	int i, n = (a->family == AF_INET ? 1 : 4);
-
-	for (i = 0; i < n; i++) {
-		if (a->addr.a6[i] == b->addr.a6[i])
-			continue;
-		if (a->addr.a6[i] < b->addr.a6[i])
-			return -1;
-		return 1;
-	}
-
-	return 0;
+	spin_lock_bh(&inet_peer_unused_lock);
+	list_del_init(&p->unused);
+	spin_unlock_bh(&inet_peer_unused_lock);
 }
-
-#define rcu_deref_locked(X, BASE)				\
-	rcu_dereference_protected(X, lockdep_is_held(&(BASE)->lock.lock))
 
 /*
  * Called with local BH disabled and the pool lock held.
+ * _stack is known to be NULL or not at compile time,
+ * so compiler will optimize the if (_stack) tests.
  */
-#define lookup(_daddr, _stack, _base)				\
+#define lookup(_daddr, _stack) 					\
 ({								\
-	struct inet_peer *u;					\
-	struct inet_peer __rcu **v;				\
-								\
-	stackptr = _stack;					\
-	*stackptr++ = &_base->root;				\
-	for (u = rcu_deref_locked(_base->root, _base);		\
-	     u != peer_avl_empty; ) {				\
-		int cmp = addr_compare(_daddr, &u->daddr);	\
-		if (cmp == 0)					\
+	struct inet_peer *u, **v;				\
+	if (_stack != NULL) {					\
+		stackptr = _stack;				\
+		*stackptr++ = &peer_root;			\
+	}							\
+	for (u = peer_root; u != peer_avl_empty; ) {		\
+		if (_daddr == u->v4daddr)			\
 			break;					\
-		if (cmp == -1)					\
+		if ((__force __u32)_daddr < (__force __u32)u->v4daddr)	\
 			v = &u->avl_left;			\
 		else						\
 			v = &u->avl_right;			\
-		*stackptr++ = v;				\
-		u = rcu_deref_locked(*v, _base);		\
+		if (_stack != NULL)				\
+			*stackptr++ = v;			\
+		u = *v;						\
 	}							\
 	u;							\
 })
 
-/*
- * Called with rcu_read_lock()
- * Because we hold no lock against a writer, its quite possible we fall
- * in an endless loop.
- * But every pointer we follow is guaranteed to be valid thanks to RCU.
- * We exit from this function if number of links exceeds PEER_MAXDEPTH
- */
-static struct inet_peer *lookup_rcu(const struct inetpeer_addr *daddr,
-				    struct inet_peer_base *base)
-{
-	struct inet_peer *u = rcu_dereference(base->root);
-	int count = 0;
-
-	while (u != peer_avl_empty) {
-		int cmp = addr_compare(daddr, &u->daddr);
-		if (cmp == 0) {
-			/* Before taking a reference, check if this entry was
-			 * deleted (refcnt=-1)
-			 */
-			if (!atomic_add_unless(&u->refcnt, 1, -1))
-				u = NULL;
-			return u;
-		}
-		if (cmp == -1)
-			u = rcu_dereference(u->avl_left);
-		else
-			u = rcu_dereference(u->avl_right);
-		if (unlikely(++count == PEER_MAXDEPTH))
-			break;
-	}
-	return NULL;
-}
-
-/* Called with local BH disabled and the pool lock held. */
-#define lookup_rightempty(start, base)				\
+/* Called with local BH disabled and the pool write lock held. */
+#define lookup_rightempty(start)				\
 ({								\
-	struct inet_peer *u;					\
-	struct inet_peer __rcu **v;				\
+	struct inet_peer *u, **v;				\
 	*stackptr++ = &start->avl_left;				\
 	v = &start->avl_left;					\
-	for (u = rcu_deref_locked(*v, base);			\
-	     u->avl_right != peer_avl_empty_rcu; ) {		\
+	for (u = *v; u->avl_right != peer_avl_empty; ) {	\
 		v = &u->avl_right;				\
 		*stackptr++ = v;				\
-		u = rcu_deref_locked(*v, base);			\
+		u = *v;						\
 	}							\
 	u;							\
 })
 
-/* Called with local BH disabled and the pool lock held.
+/* Called with local BH disabled and the pool write lock held.
  * Variable names are the proof of operation correctness.
- * Look into mm/map_avl.c for more detail description of the ideas.
- */
-static void peer_avl_rebalance(struct inet_peer __rcu **stack[],
-			       struct inet_peer __rcu ***stackend,
-			       struct inet_peer_base *base)
+ * Look into mm/map_avl.c for more detail description of the ideas.  */
+static void peer_avl_rebalance(struct inet_peer **stack[],
+		struct inet_peer ***stackend)
 {
-	struct inet_peer __rcu **nodep;
-	struct inet_peer *node, *l, *r;
+	struct inet_peer **nodep, *node, *l, *r;
 	int lh, rh;
 
 	while (stackend > stack) {
 		nodep = *--stackend;
-		node = rcu_deref_locked(*nodep, base);
-		l = rcu_deref_locked(node->avl_left, base);
-		r = rcu_deref_locked(node->avl_right, base);
+		node = *nodep;
+		l = node->avl_left;
+		r = node->avl_right;
 		lh = node_height(l);
 		rh = node_height(r);
 		if (lh > rh + 1) { /* l: RH+2 */
 			struct inet_peer *ll, *lr, *lrl, *lrr;
 			int lrh;
-			ll = rcu_deref_locked(l->avl_left, base);
-			lr = rcu_deref_locked(l->avl_right, base);
+			ll = l->avl_left;
+			lr = l->avl_right;
 			lrh = node_height(lr);
 			if (lrh <= node_height(ll)) {	/* ll: RH+1 */
-				RCU_INIT_POINTER(node->avl_left, lr);	/* lr: RH or RH+1 */
-				RCU_INIT_POINTER(node->avl_right, r);	/* r: RH */
+				node->avl_left = lr;	/* lr: RH or RH+1 */
+				node->avl_right = r;	/* r: RH */
 				node->avl_height = lrh + 1; /* RH+1 or RH+2 */
-				RCU_INIT_POINTER(l->avl_left, ll);       /* ll: RH+1 */
-				RCU_INIT_POINTER(l->avl_right, node);	/* node: RH+1 or RH+2 */
+				l->avl_left = ll;	/* ll: RH+1 */
+				l->avl_right = node;	/* node: RH+1 or RH+2 */
 				l->avl_height = node->avl_height + 1;
-				RCU_INIT_POINTER(*nodep, l);
+				*nodep = l;
 			} else { /* ll: RH, lr: RH+1 */
-				lrl = rcu_deref_locked(lr->avl_left, base);/* lrl: RH or RH-1 */
-				lrr = rcu_deref_locked(lr->avl_right, base);/* lrr: RH or RH-1 */
-				RCU_INIT_POINTER(node->avl_left, lrr);	/* lrr: RH or RH-1 */
-				RCU_INIT_POINTER(node->avl_right, r);	/* r: RH */
+				lrl = lr->avl_left;	/* lrl: RH or RH-1 */
+				lrr = lr->avl_right;	/* lrr: RH or RH-1 */
+				node->avl_left = lrr;	/* lrr: RH or RH-1 */
+				node->avl_right = r;	/* r: RH */
 				node->avl_height = rh + 1; /* node: RH+1 */
-				RCU_INIT_POINTER(l->avl_left, ll);	/* ll: RH */
-				RCU_INIT_POINTER(l->avl_right, lrl);	/* lrl: RH or RH-1 */
+				l->avl_left = ll;	/* ll: RH */
+				l->avl_right = lrl;	/* lrl: RH or RH-1 */
 				l->avl_height = rh + 1;	/* l: RH+1 */
-				RCU_INIT_POINTER(lr->avl_left, l);	/* l: RH+1 */
-				RCU_INIT_POINTER(lr->avl_right, node);	/* node: RH+1 */
+				lr->avl_left = l;	/* l: RH+1 */
+				lr->avl_right = node;	/* node: RH+1 */
 				lr->avl_height = rh + 2;
-				RCU_INIT_POINTER(*nodep, lr);
+				*nodep = lr;
 			}
 		} else if (rh > lh + 1) { /* r: LH+2 */
 			struct inet_peer *rr, *rl, *rlr, *rll;
 			int rlh;
-			rr = rcu_deref_locked(r->avl_right, base);
-			rl = rcu_deref_locked(r->avl_left, base);
+			rr = r->avl_right;
+			rl = r->avl_left;
 			rlh = node_height(rl);
 			if (rlh <= node_height(rr)) {	/* rr: LH+1 */
-				RCU_INIT_POINTER(node->avl_right, rl);	/* rl: LH or LH+1 */
-				RCU_INIT_POINTER(node->avl_left, l);	/* l: LH */
+				node->avl_right = rl;	/* rl: LH or LH+1 */
+				node->avl_left = l;	/* l: LH */
 				node->avl_height = rlh + 1; /* LH+1 or LH+2 */
-				RCU_INIT_POINTER(r->avl_right, rr);	/* rr: LH+1 */
-				RCU_INIT_POINTER(r->avl_left, node);	/* node: LH+1 or LH+2 */
+				r->avl_right = rr;	/* rr: LH+1 */
+				r->avl_left = node;	/* node: LH+1 or LH+2 */
 				r->avl_height = node->avl_height + 1;
-				RCU_INIT_POINTER(*nodep, r);
+				*nodep = r;
 			} else { /* rr: RH, rl: RH+1 */
-				rlr = rcu_deref_locked(rl->avl_right, base);/* rlr: LH or LH-1 */
-				rll = rcu_deref_locked(rl->avl_left, base);/* rll: LH or LH-1 */
-				RCU_INIT_POINTER(node->avl_right, rll);	/* rll: LH or LH-1 */
-				RCU_INIT_POINTER(node->avl_left, l);	/* l: LH */
+				rlr = rl->avl_right;	/* rlr: LH or LH-1 */
+				rll = rl->avl_left;	/* rll: LH or LH-1 */
+				node->avl_right = rll;	/* rll: LH or LH-1 */
+				node->avl_left = l;	/* l: LH */
 				node->avl_height = lh + 1; /* node: LH+1 */
-				RCU_INIT_POINTER(r->avl_right, rr);	/* rr: LH */
-				RCU_INIT_POINTER(r->avl_left, rlr);	/* rlr: LH or LH-1 */
+				r->avl_right = rr;	/* rr: LH */
+				r->avl_left = rlr;	/* rlr: LH or LH-1 */
 				r->avl_height = lh + 1;	/* r: LH+1 */
-				RCU_INIT_POINTER(rl->avl_right, r);	/* r: LH+1 */
-				RCU_INIT_POINTER(rl->avl_left, node);	/* node: LH+1 */
+				rl->avl_right = r;	/* r: LH+1 */
+				rl->avl_left = node;	/* node: LH+1 */
 				rl->avl_height = lh + 2;
-				RCU_INIT_POINTER(*nodep, rl);
+				*nodep = rl;
 			}
 		} else {
 			node->avl_height = (lh > rh ? lh : rh) + 1;
@@ -302,209 +254,327 @@ static void peer_avl_rebalance(struct inet_peer __rcu **stack[],
 	}
 }
 
-/* Called with local BH disabled and the pool lock held. */
-#define link_to_pool(n, base)					\
+/* Called with local BH disabled and the pool write lock held. */
+#define link_to_pool(n)						\
 do {								\
 	n->avl_height = 1;					\
-	n->avl_left = peer_avl_empty_rcu;			\
-	n->avl_right = peer_avl_empty_rcu;			\
-	/* lockless readers can catch us now */			\
-	rcu_assign_pointer(**--stackptr, n);			\
-	peer_avl_rebalance(stack, stackptr, base);		\
-} while (0)
+	n->avl_left = peer_avl_empty;				\
+	n->avl_right = peer_avl_empty;				\
+	**--stackptr = n;					\
+	peer_avl_rebalance(stack, stackptr);			\
+} while(0)
 
-static void inetpeer_free_rcu(struct rcu_head *head)
+/* May be called with local BH enabled. */
+static void unlink_from_pool(struct inet_peer *p)
 {
-	kmem_cache_free(peer_cachep, container_of(head, struct inet_peer, rcu));
-}
+	int do_free;
 
-static void unlink_from_pool(struct inet_peer *p, struct inet_peer_base *base,
-			     struct inet_peer __rcu **stack[PEER_MAXDEPTH])
-{
-	struct inet_peer __rcu ***stackptr, ***delp;
+	do_free = 0;
 
-	if (lookup(&p->daddr, stack, base) != p)
-		BUG();
-	delp = stackptr - 1; /* *delp[0] == p */
-	if (p->avl_left == peer_avl_empty_rcu) {
-		*delp[0] = p->avl_right;
-		--stackptr;
-	} else {
-		/* look for a node to insert instead of p */
-		struct inet_peer *t;
-		t = lookup_rightempty(p, base);
-		BUG_ON(rcu_deref_locked(*stackptr[-1], base) != t);
-		**--stackptr = t->avl_left;
-		/* t is removed, t->daddr > x->daddr for any
-		 * x in p->avl_left subtree.
-		 * Put t in the old place of p. */
-		RCU_INIT_POINTER(*delp[0], t);
-		t->avl_left = p->avl_left;
-		t->avl_right = p->avl_right;
-		t->avl_height = p->avl_height;
-		BUG_ON(delp[1] != &p->avl_left);
-		delp[1] = &t->avl_left; /* was &p->avl_left */
+	write_lock_bh(&peer_pool_lock);
+	/* Check the reference counter.  It was artificially incremented by 1
+	 * in cleanup() function to prevent sudden disappearing.  If the
+	 * reference count is still 1 then the node is referenced only as `p'
+	 * here and from the pool.  So under the exclusive pool lock it's safe
+	 * to remove the node and free it later. */
+	if (atomic_read(&p->refcnt) == 1) {
+		struct inet_peer **stack[PEER_MAXDEPTH];
+		struct inet_peer ***stackptr, ***delp;
+		if (lookup(p->v4daddr, stack) != p)
+			BUG();
+		delp = stackptr - 1; /* *delp[0] == p */
+		if (p->avl_left == peer_avl_empty) {
+			*delp[0] = p->avl_right;
+			--stackptr;
+		} else {
+			/* look for a node to insert instead of p */
+			struct inet_peer *t;
+			t = lookup_rightempty(p);
+			BUG_ON(*stackptr[-1] != t);
+			**--stackptr = t->avl_left;
+			/* t is removed, t->v4daddr > x->v4daddr for any
+			 * x in p->avl_left subtree.
+			 * Put t in the old place of p. */
+			*delp[0] = t;
+			t->avl_left = p->avl_left;
+			t->avl_right = p->avl_right;
+			t->avl_height = p->avl_height;
+			BUG_ON(delp[1] != &p->avl_left);
+			delp[1] = &t->avl_left; /* was &p->avl_left */
+		}
+		peer_avl_rebalance(stack, stackptr);
+		peer_total--;
+		do_free = 1;
 	}
-	peer_avl_rebalance(stack, stackptr, base);
-	base->total--;
-	call_rcu(&p->rcu, inetpeer_free_rcu);
+	write_unlock_bh(&peer_pool_lock);
+
+	if (do_free)
+		kmem_cache_free(peer_cachep, p);
+	else
+		/* The node is used again.  Decrease the reference counter
+		 * back.  The loop "cleanup -> unlink_from_unused
+		 *   -> unlink_from_pool -> putpeer -> link_to_unused
+		 *   -> cleanup (for the same node)"
+		 * doesn't really exist because the entry will have a
+		 * recent deletion time and will not be cleaned again soon. */
+		inet_putpeer(p);
 }
 
-static struct inet_peer_base *family_to_base(int family)
+/* May be called with local BH enabled. */
+/*
+ * cleanup_once()用来检测inet_peer_unused_head队列中
+ * 第一个闲置的对端信息块，一旦检测到
+ * 该对端信息块闲置时间达到阈值，即将
+ * 其释放。
+ * @ttl:用来检测对端信息块闲置时间的阈值。
+ */
+static int cleanup_once(unsigned long ttl)
 {
-	return family == AF_INET ? &v4_peers : &v6_peers;
+	struct inet_peer *p = NULL;
+
+	/* Remove the first entry from the list of unused nodes. */
+	spin_lock_bh(&inet_peer_unused_lock);
+	/*
+	 * 如果inet_peer_unused_head队列不为空，则获取
+	 * 其上第一个闲置的对端信息块。检测该
+	 * 对端信息块的闲置时间是否达到阈值。
+	 * 如果达到，则将其从队列中摘除，否则
+	 * 返回非0，表示没有对端信息块可释放。
+	 */
+	if (!list_empty(&unused_peers)) {
+		__u32 delta;
+
+		p = list_first_entry(&unused_peers, struct inet_peer, unused);
+		delta = (__u32)jiffies - p->dtime;
+
+		if (delta < ttl) {
+			/* Do not prune fresh entries. */
+			spin_unlock_bh(&inet_peer_unused_lock);
+			return -1;
+		}
+
+		list_del_init(&p->unused);
+
+		/* Grab an extra reference to prevent node disappearing
+		 * before unlink_from_pool() call. */
+		atomic_inc(&p->refcnt);
+	}
+	spin_unlock_bh(&inet_peer_unused_lock);
+
+	/*
+	 * 如果inet_peer_unused_head队列为空，则返回非0，表示
+	 * 没有端信息块可释放。
+	 */
+	if (p == NULL)
+		/* It means that the total number of USED entries has
+		 * grown over inet_peer_threshold.  It shouldn't really
+		 * happen because of entry limits in route cache. */
+		return -1;
+
+	/*
+	 * 调用unlink_from_pool()将对端信息块从AVL
+	 * 树中删除并释放。
+	 */
+	unlink_from_pool(p);
+	/*
+	 * 返回0，表示inet_peer_unused_head队列中可能
+	 * 还有对端信息块可释放。
+	 */
+	return 0;
 }
 
-/* perform garbage collect on all items stacked during a lookup */
-static int inet_peer_gc(struct inet_peer_base *base,
-			struct inet_peer __rcu **stack[PEER_MAXDEPTH],
-			struct inet_peer __rcu ***stackptr)
-{
-	struct inet_peer *p, *gchead = NULL;
-	__u32 delta, ttl;
-	int cnt = 0;
 
-	if (base->total >= inet_peer_threshold)
-		ttl = 0; /* be aggressive */
+/* Called with or without local BH being disabled. */
+/* Called with or without local BH being disabled. */
+/*
+ * 对端信息块的创建和查找都是通过inet_getpeer()来实现的，
+ * 由参数create来区分是创建还是查找。首先检查指定地址
+ * 的对端信息块，如果查找命中，则返回查找的结果，
+ * 否则，当create为0时返回NULL，非0时创建新的对端
+ * 信息块并添加到AVL树中，并返回该新创建的对端信息块。
+ */ //
+struct inet_peer *inet_getpeer(__be32 daddr, int create)//对端信息块的创建和查找
+{
+	struct inet_peer *p, *n;
+	struct inet_peer **stack[PEER_MAXDEPTH], ***stackptr;
+
+	/* Look up for the address quickly. */
+	/*
+	 * 根据地址在AVL树中查找对应的对端信息
+	 * 块，如果查找命中，则增加对该对端
+	 * 信息块的引用计数。
+	 */
+	read_lock_bh(&peer_pool_lock);
+	p = lookup(daddr, NULL);
+	if (p != peer_avl_empty)
+		atomic_inc(&p->refcnt);
+	read_unlock_bh(&peer_pool_lock);
+
+	/*
+	 * 如果查找到的对端信息块已经添加到
+	 * inet_peer_unused_head队列上，则先将其删除，
+	 * 以免被当作垃圾回收，然后返回查找
+	 * 到的对端信息块。
+	 */
+	if (p != peer_avl_empty) {
+		/* The existing node has been found. */
+		/* Remove the entry from unused list if it was there. */
+		unlink_from_unused(p);
+		return p;
+	}
+
+	/*
+	 * 如果根据地址没有找到相应的对端
+	 * 信息块，且是查找操作，则返回NULL。
+	 */
+	if (!create)
+		return NULL;
+
+	/* Allocate the space outside the locked region. */
+	/*
+	 * 如果根据地址没找到相应的对端信息块，
+	 * 且允许创建，则从高速缓存中分配对端
+	 * 信息块，并设置相应的值。
+	 */
+	n = kmem_cache_alloc(peer_cachep, GFP_ATOMIC);
+	if (n == NULL)
+		return NULL;
+	n->v4daddr = daddr;
+	atomic_set(&n->refcnt, 1);
+	atomic_set(&n->rid, 0);
+	n->ip_id_count = secure_ip_id(daddr);
+	n->tcp_ts_stamp = 0;
+
+	/*
+	 * 先检查是否有同样的地址的对端信息
+	 * 块已添加到AVL树，因为在分配对端
+	 * 信息块时，其他模块有可能已创建了
+	 * 相同地址的对端信息块。如果有，则
+	 * 不适用刚创建的对端信息块并将其释放。
+	 * 如果没有，则将新创建的对端信息块
+	 * 添加到AVL树并更新当前的对端信息块数。
+	 */
+	write_lock_bh(&peer_pool_lock);
+	/* Check if an entry has suddenly appeared. */
+	p = lookup(daddr, stack);
+	if (p != peer_avl_empty)
+		goto out_free;
+
+	/* Link the node. */
+	link_to_pool(n);
+	INIT_LIST_HEAD(&n->unused);
+	peer_total++;
+	write_unlock_bh(&peer_pool_lock);
+
+	/*
+	 * 如果当前对端信息块数量超过了inet_peer_threshold，
+	 * 则调用cleanup_once()释放inet_peer_unused_head队首的对端
+	 * 信息块。
+	 */
+	if (peer_total >= inet_peer_threshold)
+		/* Remove one less-recently-used entry. */
+		cleanup_once(0);
+
+	/*
+	 * 返回创建的对端信息块。
+	 */
+	return n;
+
+out_free:
+	/*
+	 * 在创建了对端信息块之后添加到AVL树时，有
+	 * 其他模块创建了相同地址的对端信息块，
+	 * 此时需要释放刚分配的对端信息块，而使用
+	 * 其他模块已创建的对端信息块。
+	 */
+	/* The appropriate node is already in the pool. */
+	atomic_inc(&p->refcnt);
+	write_unlock_bh(&peer_pool_lock);
+	/* Remove the entry from unused list if it was there. */
+	unlink_from_unused(p);
+	/* Free preallocated the preallocated node. */
+	kmem_cache_free(peer_cachep, n);
+	return p;
+}
+
+
+/* Called with local BH disabled. */
+/*
+ * peer_check_expire定时器的初始间隔时间在inet_initpeers()中
+ * 设置，而在运行中，则会根据当前对端信息块
+ * 的数量是否达到inet_peer_threshold，进行动态计算。
+ * 因此，间隔时间与inet_peer_maxttl、inet_peer_minttl和
+ * inet_peer_threshold有着密切的关系。
+ */
+static void peer_check_expire(unsigned long dummy)
+{
+	unsigned long now = jiffies;
+	int ttl;
+
+	/*
+	 * 根据当前对端信息块数计算本次垃圾回收
+	 * 的对端信息块生存期阈值。当前对端信息
+	 * 块数大于inet_peer_threshold时，使用inet_peer_minttl
+	 * 作为本次垃圾回收的对端信息块生存期
+	 * 阈值，否则根据inet_peer_maxttl来计算本次垃圾
+	 * 回收的对端信息块生存期阈值。
+	 */
+	if (peer_total >= inet_peer_threshold)
+		ttl = inet_peer_minttl;
 	else
 		ttl = inet_peer_maxttl
 				- (inet_peer_maxttl - inet_peer_minttl) / HZ *
-					base->total / inet_peer_threshold * HZ;
-	stackptr--; /* last stack slot is peer_avl_empty */
-	while (stackptr > stack) {
-		stackptr--;
-		p = rcu_deref_locked(**stackptr, base);
-		if (atomic_read(&p->refcnt) == 0) {
-			smp_rmb();
-			delta = (__u32)jiffies - p->dtime;
-			if (delta >= ttl &&
-			    atomic_cmpxchg(&p->refcnt, 0, -1) == 0) {
-				p->gc_next = gchead;
-				gchead = p;
-			}
-		}
-	}
-	while ((p = gchead) != NULL) {
-		gchead = p->gc_next;
-		cnt++;
-		unlink_from_pool(p, base, stack);
-	}
-	return cnt;
-}
-
-struct inet_peer *inet_getpeer(const struct inetpeer_addr *daddr, int create)
-{
-	struct inet_peer __rcu **stack[PEER_MAXDEPTH], ***stackptr;
-	struct inet_peer_base *base = family_to_base(daddr->family);
-	struct inet_peer *p;
-	unsigned int sequence;
-	int invalidated, gccnt = 0;
-
-	/* Attempt a lockless lookup first.
-	 * Because of a concurrent writer, we might not find an existing entry.
+					peer_total / inet_peer_threshold * HZ;
+	/*
+	 * 循环检测并删除闲置时间达到阈值
+	 * 的对端信息块。
 	 */
-	rcu_read_lock();
-	sequence = read_seqbegin(&base->lock);
-	p = lookup_rcu(daddr, base);
-	invalidated = read_seqretry(&base->lock, sequence);
-	rcu_read_unlock();
+	while (!cleanup_once(ttl)) {
+		if (jiffies != now)
+			break;
+	}
 
-	if (p)
-		return p;
-
-	/* If no writer did a change during our lookup, we can return early. */
-	if (!create && !invalidated)
-		return NULL;
-
-	/* retry an exact lookup, taking the lock before.
-	 * At least, nodes should be hot in our cache.
+	/* Trigger the timer after inet_peer_gc_mintime .. inet_peer_gc_maxtime
+	 * interval depending on the total number of entries (more entries,
+	 * less interval). */
+	/*
+	 * 根据当前对端信息块数计算peer_check_expire定时器
+	 * 下次激活时间，并重新设置该定时器。当前
+	 * 对端信息块数大于inet_peer_threshold时，使用
+	 * inet_peer_gc_mintime作为本次垃圾回收的时间间隔，
+	 * 否则根据inet_peer_gc_maxtime来计算本次垃圾回收
+	 * 的时间间隔。
 	 */
-	write_seqlock_bh(&base->lock);
-relookup:
-	p = lookup(daddr, stack, base);
-	if (p != peer_avl_empty) {
-		atomic_inc(&p->refcnt);
-		write_sequnlock_bh(&base->lock);
-		return p;
-	}
-	if (!gccnt) {
-		gccnt = inet_peer_gc(base, stack, stackptr);
-		if (gccnt && create)
-			goto relookup;
-	}
-	p = create ? kmem_cache_alloc(peer_cachep, GFP_ATOMIC) : NULL;
-	if (p) {
-		p->daddr = *daddr;
-		atomic_set(&p->refcnt, 1);
-		atomic_set(&p->rid, 0);
-		atomic_set(&p->ip_id_count,
-				(daddr->family == AF_INET) ?
-					secure_ip_id(daddr->addr.a4) :
-					secure_ipv6_id(daddr->addr.a6));
-		p->tcp_ts_stamp = 0;
-		p->metrics[RTAX_LOCK-1] = INETPEER_METRICS_NEW;
-		p->rate_tokens = 0;
-		p->rate_last = 0;
-		p->pmtu_expires = 0;
-		p->pmtu_orig = 0;
-		memset(&p->redirect_learned, 0, sizeof(p->redirect_learned));
-
-
-		/* Link the node. */
-		link_to_pool(p, base);
-		base->total++;
-	}
-	write_sequnlock_bh(&base->lock);
-
-	return p;
+	if (peer_total >= inet_peer_threshold)
+		peer_periodic_timer.expires = jiffies + inet_peer_gc_mintime;
+	else
+		peer_periodic_timer.expires = jiffies
+			+ inet_peer_gc_maxtime
+			- (inet_peer_gc_maxtime - inet_peer_gc_mintime) / HZ *
+				peer_total / inet_peer_threshold * HZ;
+	add_timer(&peer_periodic_timer);
 }
-EXPORT_SYMBOL_GPL(inet_getpeer);
-
-void inet_putpeer(struct inet_peer *p)
-{
-	p->dtime = (__u32)jiffies;
-	smp_mb__before_atomic_dec();
-	atomic_dec(&p->refcnt);
-}
-EXPORT_SYMBOL_GPL(inet_putpeer);
 
 /*
- *	Check transmit rate limitation for given message.
- *	The rate information is held in the inet_peer entries now.
- *	This function is generic and could be used for other purposes
- *	too. It uses a Token bucket filter as suggested by Alexey Kuznetsov.
- *
- *	Note that the same inet_peer fields are modified by functions in
- *	route.c too, but these work for packet destinations while xrlim_allow
- *	works for icmp destinations. This means the rate limiting information
- *	for one "ip object" is shared - and these ICMPs are twice limited:
- *	by source and by destination.
- *
- *	RFC 1812: 4.3.2.8 SHOULD be able to limit error message rate
- *			  SHOULD allow setting of rate limits
- *
- * 	Shared between ICMPv4 and ICMPv6.
+ * 当使用完对端信息块之后，需要将其删除并释放。
+ * 实际上，inet_putpeer()只是将该对端信息块添加到
+ * unused_peers队列上，表示该对端信息块当前
+ * 没有被使用。而真正的删除和释放，由垃圾
+ * 回收机制来处理.
  */
-#define XRLIM_BURST_FACTOR 6
-bool inet_peer_xrlim_allow(struct inet_peer *peer, int timeout)
+void inet_putpeer(struct inet_peer *p)
 {
-	unsigned long now, token;
-	bool rc = false;
-
-	if (!peer)
-		return true;
-
-	token = peer->rate_tokens;
-	now = jiffies;
-	token += now - peer->rate_last;
-	peer->rate_last = now;
-	if (token > XRLIM_BURST_FACTOR * timeout)
-		token = XRLIM_BURST_FACTOR * timeout;
-	if (token >= timeout) {
-		token -= timeout;
-		rc = true;
+	spin_lock_bh(&inet_peer_unused_lock);
+	/*
+	 * 当待删除的对端信息块的引用计数为0时,
+	 * 表示没有被使用,此时将它添加到
+	 * inet_peer_unused_head队列上,等待垃圾回收或
+	 * 再次被使用.
+	 */
+	if (atomic_dec_and_test(&p->refcnt)) {
+		list_add_tail(&p->unused, &unused_peers);
+		p->dtime = (__u32)jiffies;
 	}
-	peer->rate_tokens = token;
-	return rc;
+	spin_unlock_bh(&inet_peer_unused_lock);
 }
-EXPORT_SYMBOL(inet_peer_xrlim_allow);
+

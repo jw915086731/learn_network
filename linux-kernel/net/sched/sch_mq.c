@@ -11,7 +11,6 @@
 #include <linux/types.h>
 #include <linux/slab.h>
 #include <linux/kernel.h>
-#include <linux/export.h>
 #include <linux/string.h>
 #include <linux/errno.h>
 #include <linux/skbuff.h>
@@ -57,11 +56,12 @@ static int mq_init(struct Qdisc *sch, struct nlattr *opt)
 
 	for (ntx = 0; ntx < dev->num_tx_queues; ntx++) {
 		dev_queue = netdev_get_tx_queue(dev, ntx);
-		qdisc = qdisc_create_dflt(dev_queue, &pfifo_fast_ops,
+		qdisc = qdisc_create_dflt(dev, dev_queue, &pfifo_fast_ops,
 					  TC_H_MAKE(TC_H_MAJ(sch->handle),
 						    TC_H_MIN(ntx + 1)));
 		if (qdisc == NULL)
 			goto err;
+		qdisc->flags |= TCQ_F_CAN_BYPASS;
 		priv->qdiscs[ntx] = qdisc;
 	}
 
@@ -229,7 +229,7 @@ static const struct Qdisc_class_ops mq_class_ops = {
 	.dump_stats	= mq_dump_class_stats,
 };
 
-struct Qdisc_ops mq_qdisc_ops __read_mostly = {
+struct Qdisc_ops mq_qdisc_ops {//__read_mostly = {
 	.cl_ops		= &mq_class_ops,
 	.id		= "mq",
 	.priv_size	= sizeof(struct mq_sched),

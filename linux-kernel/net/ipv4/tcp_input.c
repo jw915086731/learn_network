@@ -78,13 +78,10 @@ int sysctl_tcp_window_scaling __read_mostly = 1;
 int sysctl_tcp_sack __read_mostly = 1;
 int sysctl_tcp_fack __read_mostly = 1;
 int sysctl_tcp_reordering __read_mostly = TCP_FASTRETRANS_THRESH;
-EXPORT_SYMBOL(sysctl_tcp_reordering);
 int sysctl_tcp_ecn __read_mostly = 2;
-EXPORT_SYMBOL(sysctl_tcp_ecn);
 int sysctl_tcp_dsack __read_mostly = 1;
 int sysctl_tcp_app_win __read_mostly = 31;
 int sysctl_tcp_adv_win_scale __read_mostly = 2;
-EXPORT_SYMBOL(sysctl_tcp_adv_win_scale);
 
 int sysctl_tcp_stdurg __read_mostly;
 int sysctl_tcp_rfc1337 __read_mostly;
@@ -182,7 +179,7 @@ static void tcp_incr_quickack(struct sock *sk)
 		icsk->icsk_ack.quick = min(quickacks, TCP_MAX_QUICKACKS);
 }
 
-static void tcp_enter_quickack_mode(struct sock *sk)
+void tcp_enter_quickack_mode(struct sock *sk)
 {
 	struct inet_connection_sock *icsk = inet_csk(sk);
 	tcp_incr_quickack(sk);
@@ -206,7 +203,7 @@ static inline void TCP_ECN_queue_cwr(struct tcp_sock *tp)
 		tp->ecn_flags |= TCP_ECN_QUEUE_CWR;
 }
 
-static inline void TCP_ECN_accept_cwr(struct tcp_sock *tp, const struct sk_buff *skb)
+static inline void TCP_ECN_accept_cwr(struct tcp_sock *tp, struct sk_buff *skb)
 {
 	if (tcp_hdr(skb)->cwr)
 		tp->ecn_flags &= ~TCP_ECN_DEMAND_CWR;
@@ -217,41 +214,32 @@ static inline void TCP_ECN_withdraw_cwr(struct tcp_sock *tp)
 	tp->ecn_flags &= ~TCP_ECN_DEMAND_CWR;
 }
 
-static inline void TCP_ECN_check_ce(struct tcp_sock *tp, const struct sk_buff *skb)
+static inline void TCP_ECN_check_ce(struct tcp_sock *tp, struct sk_buff *skb)
 {
-	if (!(tp->ecn_flags & TCP_ECN_OK))
-		return;
-
-	switch (TCP_SKB_CB(skb)->ip_dsfield & INET_ECN_MASK) {
-	case INET_ECN_NOT_ECT:
+	if (tp->ecn_flags & TCP_ECN_OK) {
+		if (INET_ECN_is_ce(TCP_SKB_CB(skb)->flags))
+			tp->ecn_flags |= TCP_ECN_DEMAND_CWR;
 		/* Funny extension: if ECT is not set on a segment,
-		 * and we already seen ECT on a previous segment,
-		 * it is probably a retransmit.
-		 */
-		if (tp->ecn_flags & TCP_ECN_SEEN)
+		 * it is surely retransmit. It is not in ECN RFC,
+		 * but Linux follows this rule. */
+		else if (INET_ECN_is_not_ect((TCP_SKB_CB(skb)->flags)))
 			tcp_enter_quickack_mode((struct sock *)tp);
-		break;
-	case INET_ECN_CE:
-		tp->ecn_flags |= TCP_ECN_DEMAND_CWR;
-		/* fallinto */
-	default:
-		tp->ecn_flags |= TCP_ECN_SEEN;
 	}
 }
 
-static inline void TCP_ECN_rcv_synack(struct tcp_sock *tp, const struct tcphdr *th)
+static inline void TCP_ECN_rcv_synack(struct tcp_sock *tp, struct tcphdr *th)
 {
 	if ((tp->ecn_flags & TCP_ECN_OK) && (!th->ece || th->cwr))
 		tp->ecn_flags &= ~TCP_ECN_OK;
 }
 
-static inline void TCP_ECN_rcv_syn(struct tcp_sock *tp, const struct tcphdr *th)
+static inline void TCP_ECN_rcv_syn(struct tcp_sock *tp, struct tcphdr *th)
 {
 	if ((tp->ecn_flags & TCP_ECN_OK) && (!th->ece || !th->cwr))
 		tp->ecn_flags &= ~TCP_ECN_OK;
 }
 
-static inline int TCP_ECN_rcv_ecn_echo(const struct tcp_sock *tp, const struct tcphdr *th)
+static inline int TCP_ECN_rcv_ecn_echo(struct tcp_sock *tp, struct tcphdr *th)
 {
 	if (th->ece && !th->syn && (tp->ecn_flags & TCP_ECN_OK))
 		return 1;
@@ -265,11 +253,11 @@ static inline int TCP_ECN_rcv_ecn_echo(const struct tcp_sock *tp, const struct t
 
 static void tcp_fixup_sndbuf(struct sock *sk)
 {
-	int sndmem = SKB_TRUESIZE(tcp_sk(sk)->rx_opt.mss_clamp + MAX_TCP_HEADER);
+	int sndmem = tcp_sk(sk)->rx_opt.mss_clamp + MAX_TCP_HEADER + 16 +
+		     sizeof(struct sk_buff);
 
-	sndmem *= TCP_INIT_CWND;
-	if (sk->sk_sndbuf < sndmem)
-		sk->sk_sndbuf = min(sndmem, sysctl_tcp_wmem[2]);
+	if (sk->sk_sndbuf < 3 * sndmem)
+		sk->sk_sndbuf = min(3 * sndmem, sysctl_tcp_wmem[2]);
 }
 
 /* 2. Tuning advertised window (window_clamp, rcv_ssthresh)
@@ -315,7 +303,7 @@ static int __tcp_grow_window(const struct sock *sk, const struct sk_buff *skb)
 	return 0;
 }
 
-static void tcp_grow_window(struct sock *sk, const struct sk_buff *skb)
+static void tcp_grow_window(struct sock *sk, struct sk_buff *skb)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 
@@ -345,35 +333,28 @@ static void tcp_grow_window(struct sock *sk, const struct sk_buff *skb)
 
 static void tcp_fixup_rcvbuf(struct sock *sk)
 {
-	u32 mss = tcp_sk(sk)->advmss;
-	u32 icwnd = TCP_DEFAULT_INIT_RCVWND;
-	int rcvmem;
+	struct tcp_sock *tp = tcp_sk(sk);
+	int rcvmem = tp->advmss + MAX_TCP_HEADER + 16 + sizeof(struct sk_buff);
 
-	/* Limit to 10 segments if mss <= 1460,
-	 * or 14600/mss segments, with a minimum of two segments.
+	/* Try to select rcvbuf so that 4 mss-sized segments
+	 * will fit to window and corresponding skbs will fit to our rcvbuf.
+	 * (was 3; 4 is minimum to allow fast retransmit to work.)
 	 */
-	if (mss > 1460)
-		icwnd = max_t(u32, (1460 * TCP_DEFAULT_INIT_RCVWND) / mss, 2);
-
-	rcvmem = SKB_TRUESIZE(mss + MAX_TCP_HEADER);
-	while (tcp_win_from_space(rcvmem) < mss)
+	while (tcp_win_from_space(rcvmem) < tp->advmss)
 		rcvmem += 128;
-
-	rcvmem *= icwnd;
-
-	if (sk->sk_rcvbuf < rcvmem)
-		sk->sk_rcvbuf = min(rcvmem, sysctl_tcp_rmem[2]);
+	if (sk->sk_rcvbuf < 4 * rcvmem)//这种情况下才会重新设置sk_rcvbuf空间大小
+		sk->sk_rcvbuf = min(4 * rcvmem, sysctl_tcp_rmem[2]);
 }
 
 /* 4. Try to fixup all. It is made immediately after connection enters
- *    established state.
+ *    established state.当进入establish状态之后,sock会自己调整sndbuf和rcvbuf.他是通过tcp_init_buffer_space来进行调整的.这个函数会调用tcp_fixup_rcvbuf和tcp_fixup_sndbuf来调整读写buf的大小. 
  */
 static void tcp_init_buffer_space(struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	int maxwin;
 
-	if (!(sk->sk_userlocks & SOCK_RCVBUF_LOCK))
+	if (!(sk->sk_userlocks & SOCK_RCVBUF_LOCK)) //如果用户没有设置rcvbuf和sndbuf的时候，会自动调整这两个值
 		tcp_fixup_rcvbuf(sk);
 	if (!(sk->sk_userlocks & SOCK_SNDBUF_LOCK))
 		tcp_fixup_sndbuf(sk);
@@ -412,7 +393,7 @@ static void tcp_clamp_window(struct sock *sk)
 	if (sk->sk_rcvbuf < sysctl_tcp_rmem[2] &&
 	    !(sk->sk_userlocks & SOCK_RCVBUF_LOCK) &&
 	    !tcp_memory_pressure &&
-	    atomic_long_read(&tcp_memory_allocated) < sysctl_tcp_mem[0]) {
+	    atomic_read(&tcp_memory_allocated) < sysctl_tcp_mem[0]) {
 		sk->sk_rcvbuf = min(atomic_read(&sk->sk_rmem_alloc),
 				    sysctl_tcp_rmem[2]);
 	}
@@ -429,7 +410,7 @@ static void tcp_clamp_window(struct sock *sk)
  */
 void tcp_initialize_rcv_mss(struct sock *sk)
 {
-	const struct tcp_sock *tp = tcp_sk(sk);
+	struct tcp_sock *tp = tcp_sk(sk);
 	unsigned int hint = min_t(unsigned int, tp->advmss, tp->mss_cache);
 
 	hint = min(hint, tp->rcv_wnd / 2);
@@ -438,16 +419,15 @@ void tcp_initialize_rcv_mss(struct sock *sk)
 
 	inet_csk(sk)->icsk_ack.rcv_mss = hint;
 }
-EXPORT_SYMBOL(tcp_initialize_rcv_mss);
 
 /* Receiver "autotuning" code.
  *
  * The algorithm for RTT estimation w/o timestamps is based on
  * Dynamic Right-Sizing (DRS) by Wu Feng and Mike Fisk of LANL.
- * <http://public.lanl.gov/radiant/pubs.html#DRS>
+ * <http://www.lanl.gov/radiant/website/pubs/drs/lacsi2001.ps>
  *
  * More detail on this code can be found at
- * <http://staff.psc.edu/jheffner/>,
+ * <http://www.psc.edu/~jheffner/senior_thesis.ps>,
  * though this reference is out of date.  A new paper
  * is pending.
  */
@@ -544,7 +524,8 @@ void tcp_rcv_space_adjust(struct sock *sk)
 			space /= tp->advmss;
 			if (!space)
 				space = 1;
-			rcvmem = SKB_TRUESIZE(tp->advmss + MAX_TCP_HEADER);
+			rcvmem = (tp->advmss + MAX_TCP_HEADER +
+				  16 + sizeof(struct sk_buff));
 			while (tcp_win_from_space(rcvmem) < tp->advmss)
 				rcvmem += 128;
 			space *= rcvmem;
@@ -746,7 +727,7 @@ void tcp_update_metrics(struct sock *sk)
 			 * Reset our results.
 			 */
 			if (!(dst_metric_locked(dst, RTAX_RTT)))
-				dst_metric_set(dst, RTAX_RTT, 0);
+				dst->metrics[RTAX_RTT - 1] = 0;
 			return;
 		}
 
@@ -788,48 +769,57 @@ void tcp_update_metrics(struct sock *sk)
 			if (dst_metric(dst, RTAX_SSTHRESH) &&
 			    !dst_metric_locked(dst, RTAX_SSTHRESH) &&
 			    (tp->snd_cwnd >> 1) > dst_metric(dst, RTAX_SSTHRESH))
-				dst_metric_set(dst, RTAX_SSTHRESH, tp->snd_cwnd >> 1);
+				dst->metrics[RTAX_SSTHRESH-1] = tp->snd_cwnd >> 1;
 			if (!dst_metric_locked(dst, RTAX_CWND) &&
 			    tp->snd_cwnd > dst_metric(dst, RTAX_CWND))
-				dst_metric_set(dst, RTAX_CWND, tp->snd_cwnd);
+				dst->metrics[RTAX_CWND - 1] = tp->snd_cwnd;
 		} else if (tp->snd_cwnd > tp->snd_ssthresh &&
 			   icsk->icsk_ca_state == TCP_CA_Open) {
 			/* Cong. avoidance phase, cwnd is reliable. */
 			if (!dst_metric_locked(dst, RTAX_SSTHRESH))
-				dst_metric_set(dst, RTAX_SSTHRESH,
-					       max(tp->snd_cwnd >> 1, tp->snd_ssthresh));
+				dst->metrics[RTAX_SSTHRESH-1] =
+					max(tp->snd_cwnd >> 1, tp->snd_ssthresh);
 			if (!dst_metric_locked(dst, RTAX_CWND))
-				dst_metric_set(dst, RTAX_CWND,
-					       (dst_metric(dst, RTAX_CWND) +
-						tp->snd_cwnd) >> 1);
+				dst->metrics[RTAX_CWND-1] = (dst_metric(dst, RTAX_CWND) + tp->snd_cwnd) >> 1;
 		} else {
 			/* Else slow start did not finish, cwnd is non-sense,
 			   ssthresh may be also invalid.
 			 */
 			if (!dst_metric_locked(dst, RTAX_CWND))
-				dst_metric_set(dst, RTAX_CWND,
-					       (dst_metric(dst, RTAX_CWND) +
-						tp->snd_ssthresh) >> 1);
+				dst->metrics[RTAX_CWND-1] = (dst_metric(dst, RTAX_CWND) + tp->snd_ssthresh) >> 1;
 			if (dst_metric(dst, RTAX_SSTHRESH) &&
 			    !dst_metric_locked(dst, RTAX_SSTHRESH) &&
 			    tp->snd_ssthresh > dst_metric(dst, RTAX_SSTHRESH))
-				dst_metric_set(dst, RTAX_SSTHRESH, tp->snd_ssthresh);
+				dst->metrics[RTAX_SSTHRESH-1] = tp->snd_ssthresh;
 		}
 
 		if (!dst_metric_locked(dst, RTAX_REORDERING)) {
 			if (dst_metric(dst, RTAX_REORDERING) < tp->reordering &&
 			    tp->reordering != sysctl_tcp_reordering)
-				dst_metric_set(dst, RTAX_REORDERING, tp->reordering);
+				dst->metrics[RTAX_REORDERING-1] = tp->reordering;
 		}
 	}
 }
 
-__u32 tcp_init_cwnd(const struct tcp_sock *tp, const struct dst_entry *dst)
+/* Numbers are taken from RFC3390.
+ *
+ * John Heffner states:
+ *
+ *	The RFC specifies a window of no more than 4380 bytes
+ *	unless 2*MSS > 4380.  Reading the pseudocode in the RFC
+ *	is a bit misleading because they use a clamp at 4380 bytes
+ *	rather than use a multiplier in the relevant range.
+ */
+__u32 tcp_init_cwnd(struct tcp_sock *tp, struct dst_entry *dst)
 {
 	__u32 cwnd = (dst ? dst_metric(dst, RTAX_INITCWND) : 0);
 
-	if (!cwnd)
-		cwnd = TCP_INIT_CWND;
+	if (!cwnd) {
+		if (tp->mss_cache > 1460)
+			cwnd = 2;
+		else
+			cwnd = (tp->mss_cache > 1095) ? 3 : 4;
+	}
 	return min_t(__u32, cwnd, tp->snd_cwnd_clamp);
 }
 
@@ -892,11 +882,6 @@ static void tcp_init_metrics(struct sock *sk)
 		tp->snd_ssthresh = dst_metric(dst, RTAX_SSTHRESH);
 		if (tp->snd_ssthresh > tp->snd_cwnd_clamp)
 			tp->snd_ssthresh = tp->snd_cwnd_clamp;
-	} else {
-		/* ssthresh may have been reduced unnecessarily during.
-		 * 3WHS. Restore it back to its initial default.
-		 */
-		tp->snd_ssthresh = TCP_INFINITE_SSTHRESH;
 	}
 	if (dst_metric(dst, RTAX_REORDERING) &&
 	    tp->reordering != dst_metric(dst, RTAX_REORDERING)) {
@@ -904,7 +889,10 @@ static void tcp_init_metrics(struct sock *sk)
 		tp->reordering = dst_metric(dst, RTAX_REORDERING);
 	}
 
-	if (dst_metric(dst, RTAX_RTT) == 0 || tp->srtt == 0)
+	if (dst_metric(dst, RTAX_RTT) == 0)
+		goto reset;
+
+	if (!tp->srtt && dst_metric_rtt(dst, RTAX_RTT) < (TCP_TIMEOUT_INIT << 3))
 		goto reset;
 
 	/* Initial rtt is determined from SYN,SYN-ACK.
@@ -930,27 +918,25 @@ static void tcp_init_metrics(struct sock *sk)
 		tp->mdev_max = tp->rttvar = max(tp->mdev, tcp_rto_min(sk));
 	}
 	tcp_set_rto(sk);
-reset:
-	if (tp->srtt == 0) {
-		/* RFC2988bis: We've failed to get a valid RTT sample from
-		 * 3WHS. This is most likely due to retransmission,
-		 * including spurious one. Reset the RTO back to 3secs
-		 * from the more aggressive 1sec to avoid more spurious
-		 * retransmission.
-		 */
-		tp->mdev = tp->mdev_max = tp->rttvar = TCP_TIMEOUT_FALLBACK;
-		inet_csk(sk)->icsk_rto = TCP_TIMEOUT_FALLBACK;
-	}
-	/* Cut cwnd down to 1 per RFC5681 if SYN or SYN-ACK has been
-	 * retransmitted. In light of RFC2988bis' more aggressive 1sec
-	 * initRTO, we only reset cwnd when more than 1 SYN/SYN-ACK
-	 * retransmission has occurred.
-	 */
-	if (tp->total_retrans > 1)
-		tp->snd_cwnd = 1;
-	else
-		tp->snd_cwnd = tcp_init_cwnd(tp, dst);
+	if (inet_csk(sk)->icsk_rto < TCP_TIMEOUT_INIT && !tp->rx_opt.saw_tstamp)
+		goto reset;
+
+cwnd:
+	tp->snd_cwnd = tcp_init_cwnd(tp, dst);
 	tp->snd_cwnd_stamp = tcp_time_stamp;
+	return;
+
+reset:
+	/* Play conservative. If timestamps are not
+	 * supported, TCP will fail to recalculate correct
+	 * rtt, if initial rto is too small. FORGET ALL AND RESET!
+	 */
+	if (!tp->rx_opt.saw_tstamp && tp->srtt) {
+		tp->srtt = 0;
+		tp->mdev = tp->mdev_max = tp->rttvar = TCP_TIMEOUT_INIT;
+		inet_csk(sk)->icsk_rto = TCP_TIMEOUT_INIT;
+	}
+	goto cwnd;
 }
 
 static void tcp_update_reordering(struct sock *sk, const int metric,
@@ -1136,7 +1122,7 @@ static int tcp_is_sackblock_valid(struct tcp_sock *tp, int is_dsack,
 		return 0;
 
 	/* ...Then it's D-SACK, and must reside below snd_una completely */
-	if (after(end_seq, tp->snd_una))
+	if (!after(end_seq, tp->snd_una))
 		return 0;
 
 	if (!before(start_seq, tp->undo_marker))
@@ -1216,7 +1202,7 @@ static void tcp_mark_lost_retrans(struct sock *sk)
 		tp->lost_retrans_low = new_low_seq;
 }
 
-static int tcp_check_dsack(struct sock *sk, const struct sk_buff *ack_skb,
+static int tcp_check_dsack(struct sock *sk, struct sk_buff *ack_skb,
 			   struct tcp_sack_block_wire *sp, int num_sacks,
 			   u32 prior_snd_una)
 {
@@ -1243,7 +1229,7 @@ static int tcp_check_dsack(struct sock *sk, const struct sk_buff *ack_skb,
 	}
 
 	/* D-SACK for already forgotten data... Do dumb counting. */
-	if (dup_sack && tp->undo_marker && tp->undo_retrans &&
+	if (dup_sack &&
 	    !after(end_seq_0, prior_snd_una) &&
 	    after(end_seq_0, tp->undo_marker))
 		tp->undo_retrans--;
@@ -1310,7 +1296,7 @@ static int tcp_match_skb_to_sack(struct sock *sk, struct sk_buff *skb,
 	return in_sack;
 }
 
-static u8 tcp_sacktag_one(const struct sk_buff *skb, struct sock *sk,
+static u8 tcp_sacktag_one(struct sk_buff *skb, struct sock *sk,
 			  struct tcp_sacktag_state *state,
 			  int dup_sack, int pcount)
 {
@@ -1320,8 +1306,7 @@ static u8 tcp_sacktag_one(const struct sk_buff *skb, struct sock *sk,
 
 	/* Account D-SACK for retransmitted packet. */
 	if (dup_sack && (sacked & TCPCB_RETRANS)) {
-		if (tp->undo_marker && tp->undo_retrans &&
-		    after(TCP_SKB_CB(skb)->end_seq, tp->undo_marker))
+		if (after(TCP_SKB_CB(skb)->end_seq, tp->undo_marker))
 			tp->undo_retrans--;
 		if (sacked & TCPCB_SACKED_ACKED)
 			state->reord = min(fack_count, state->reord);
@@ -1401,7 +1386,9 @@ static int tcp_shifted_skb(struct sock *sk, struct sk_buff *skb,
 
 	BUG_ON(!pcount);
 
-	if (skb == tp->lost_skb_hint)
+	/* Tweak before seqno plays */
+	if (!tcp_is_fack(tp) && tcp_is_sack(tp) && tp->lost_skb_hint &&
+	    !before(TCP_SKB_CB(tp->lost_skb_hint)->seq, TCP_SKB_CB(skb)->seq))
 		tp->lost_cnt_hint += pcount;
 
 	TCP_SKB_CB(prev)->end_seq += shifted;
@@ -1450,7 +1437,7 @@ static int tcp_shifted_skb(struct sock *sk, struct sk_buff *skb,
 		tp->lost_cnt_hint -= tcp_skb_pcount(prev);
 	}
 
-	TCP_SKB_CB(skb)->tcp_flags |= TCP_SKB_CB(prev)->tcp_flags;
+	TCP_SKB_CB(skb)->flags |= TCP_SKB_CB(prev)->flags;
 	if (skb == tcp_highest_sack(sk))
 		tcp_advance_highest_sack(sk, skb);
 
@@ -1465,13 +1452,13 @@ static int tcp_shifted_skb(struct sock *sk, struct sk_buff *skb,
 /* I wish gso_size would have a bit more sane initialization than
  * something-or-zero which complicates things
  */
-static int tcp_skb_seglen(const struct sk_buff *skb)
+static int tcp_skb_seglen(struct sk_buff *skb)
 {
 	return tcp_skb_pcount(skb) == 1 ? skb->len : tcp_skb_mss(skb);
 }
 
 /* Shifting pages past head area doesn't work */
-static int skb_can_shift(const struct sk_buff *skb)
+static int skb_can_shift(struct sk_buff *skb)
 {
 	return !skb_headlen(skb) && skb_is_nonlinear(skb);
 }
@@ -1720,19 +1707,19 @@ static struct sk_buff *tcp_maybe_skipping_dsack(struct sk_buff *skb,
 	return skb;
 }
 
-static int tcp_sack_cache_ok(const struct tcp_sock *tp, const struct tcp_sack_block *cache)
+static int tcp_sack_cache_ok(struct tcp_sock *tp, struct tcp_sack_block *cache)
 {
 	return cache < tp->recv_sack_cache + ARRAY_SIZE(tp->recv_sack_cache);
 }
 
 static int
-tcp_sacktag_write_queue(struct sock *sk, const struct sk_buff *ack_skb,
+tcp_sacktag_write_queue(struct sock *sk, struct sk_buff *ack_skb,
 			u32 prior_snd_una)
 {
 	const struct inet_connection_sock *icsk = inet_csk(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
-	const unsigned char *ptr = (skb_transport_header(ack_skb) +
-				    TCP_SKB_CB(ack_skb)->sacked);
+	unsigned char *ptr = (skb_transport_header(ack_skb) +
+			      TCP_SKB_CB(ack_skb)->sacked);
 	struct tcp_sack_block_wire *sp_wire = (struct tcp_sack_block_wire *)(ptr+2);
 	struct tcp_sack_block sp[TCP_NUM_SACKS];
 	struct tcp_sack_block *cache;
@@ -2296,7 +2283,7 @@ static int tcp_check_sack_reneging(struct sock *sk, int flag)
 	return 0;
 }
 
-static inline int tcp_fackets_out(const struct tcp_sock *tp)
+static inline int tcp_fackets_out(struct tcp_sock *tp)
 {
 	return tcp_is_reno(tp) ? tp->sacked_out + 1 : tp->fackets_out;
 }
@@ -2316,20 +2303,19 @@ static inline int tcp_fackets_out(const struct tcp_sock *tp)
  * they differ. Since neither occurs due to loss, TCP should really
  * ignore them.
  */
-static inline int tcp_dupack_heuristics(const struct tcp_sock *tp)
+static inline int tcp_dupack_heuristics(struct tcp_sock *tp)
 {
 	return tcp_is_fack(tp) ? tp->fackets_out : tp->sacked_out + 1;
 }
 
-static inline int tcp_skb_timedout(const struct sock *sk,
-				   const struct sk_buff *skb)
+static inline int tcp_skb_timedout(struct sock *sk, struct sk_buff *skb)
 {
-	return tcp_time_stamp - TCP_SKB_CB(skb)->when > inet_csk(sk)->icsk_rto;
+	return (tcp_time_stamp - TCP_SKB_CB(skb)->when > inet_csk(sk)->icsk_rto);
 }
 
-static inline int tcp_head_timedout(const struct sock *sk)
+static inline int tcp_head_timedout(struct sock *sk)
 {
-	const struct tcp_sock *tp = tcp_sk(sk);
+	struct tcp_sock *tp = tcp_sk(sk);
 
 	return tp->packets_out &&
 	       tcp_skb_timedout(sk, tcp_write_queue_head(sk));
@@ -2518,7 +2504,7 @@ static void tcp_timeout_skbs(struct sock *sk)
 /* Mark head of queue up as lost. With RFC3517 SACK, the packets is
  * is against sacked "cnt", otherwise it's against facked "cnt"
  */
-static void tcp_mark_head_lost(struct sock *sk, int packets, int mark_head)
+static void tcp_mark_head_lost(struct sock *sk, int packets)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct sk_buff *skb;
@@ -2526,13 +2512,13 @@ static void tcp_mark_head_lost(struct sock *sk, int packets, int mark_head)
 	int err;
 	unsigned int mss;
 
+	if (packets == 0)
+		return;
+
 	WARN_ON(packets > tp->packets_out);
 	if (tp->lost_skb_hint) {
 		skb = tp->lost_skb_hint;
 		cnt = tp->lost_cnt_hint;
-		/* Head already handled? */
-		if (mark_head && skb != tcp_write_queue_head(sk))
-			return;
 	} else {
 		skb = tcp_write_queue_head(sk);
 		cnt = 0;
@@ -2555,8 +2541,7 @@ static void tcp_mark_head_lost(struct sock *sk, int packets, int mark_head)
 			cnt += tcp_skb_pcount(skb);
 
 		if (cnt > packets) {
-			if ((tcp_is_sack(tp) && !tcp_is_fack(tp)) ||
-			    (oldcnt >= packets))
+			if (tcp_is_sack(tp) || (oldcnt >= packets))
 				break;
 
 			mss = skb_shinfo(skb)->gso_size;
@@ -2567,9 +2552,6 @@ static void tcp_mark_head_lost(struct sock *sk, int packets, int mark_head)
 		}
 
 		tcp_skb_mark_lost(tp, skb);
-
-		if (mark_head)
-			break;
 	}
 	tcp_verify_left_out(tp);
 }
@@ -2581,18 +2563,17 @@ static void tcp_update_scoreboard(struct sock *sk, int fast_rexmit)
 	struct tcp_sock *tp = tcp_sk(sk);
 
 	if (tcp_is_reno(tp)) {
-		tcp_mark_head_lost(sk, 1, 1);
+		tcp_mark_head_lost(sk, 1);
 	} else if (tcp_is_fack(tp)) {
 		int lost = tp->fackets_out - tp->reordering;
 		if (lost <= 0)
 			lost = 1;
-		tcp_mark_head_lost(sk, lost, 0);
+		tcp_mark_head_lost(sk, lost);
 	} else {
 		int sacked_upto = tp->sacked_out - tp->reordering;
-		if (sacked_upto >= 0)
-			tcp_mark_head_lost(sk, sacked_upto, 0);
-		else if (fast_rexmit)
-			tcp_mark_head_lost(sk, 1, 1);
+		if (sacked_upto < fast_rexmit)
+			sacked_upto = fast_rexmit;
+		tcp_mark_head_lost(sk, sacked_upto);
 	}
 
 	tcp_timeout_skbs(sk);
@@ -2640,7 +2621,7 @@ static void tcp_cwnd_down(struct sock *sk, int flag)
 /* Nothing was retransmitted or returned timestamp is less
  * than timestamp of the first retransmission.
  */
-static inline int tcp_packet_delayed(const struct tcp_sock *tp)
+static inline int tcp_packet_delayed(struct tcp_sock *tp)
 {
 	return !tp->retrans_stamp ||
 		(tp->rx_opt.saw_tstamp && tp->rx_opt.rcv_tsecr &&
@@ -2679,7 +2660,7 @@ static void DBGUNDO(struct sock *sk, const char *msg)
 #define DBGUNDO(x...) do { } while (0)
 #endif
 
-static void tcp_undo_cwr(struct sock *sk, const bool undo_ssthresh)
+static void tcp_undo_cwr(struct sock *sk, const int undo)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 
@@ -2691,17 +2672,18 @@ static void tcp_undo_cwr(struct sock *sk, const bool undo_ssthresh)
 		else
 			tp->snd_cwnd = max(tp->snd_cwnd, tp->snd_ssthresh << 1);
 
-		if (undo_ssthresh && tp->prior_ssthresh > tp->snd_ssthresh) {
+		if (undo && tp->prior_ssthresh > tp->snd_ssthresh) {
 			tp->snd_ssthresh = tp->prior_ssthresh;
 			TCP_ECN_withdraw_cwr(tp);
 		}
 	} else {
 		tp->snd_cwnd = max(tp->snd_cwnd, tp->snd_ssthresh);
 	}
+	tcp_moderate_cwnd(tp);
 	tp->snd_cwnd_stamp = tcp_time_stamp;
 }
 
-static inline int tcp_may_undo(const struct tcp_sock *tp)
+static inline int tcp_may_undo(struct tcp_sock *tp)
 {
 	return tp->undo_marker && (!tp->undo_retrans || tcp_packet_delayed(tp));
 }
@@ -2718,7 +2700,7 @@ static int tcp_try_undo_recovery(struct sock *sk)
 		 * or our original transmission succeeded.
 		 */
 		DBGUNDO(sk, inet_csk(sk)->icsk_ca_state == TCP_CA_Loss ? "loss" : "retrans");
-		tcp_undo_cwr(sk, true);
+		tcp_undo_cwr(sk, 1);
 		if (inet_csk(sk)->icsk_ca_state == TCP_CA_Loss)
 			mib_idx = LINUX_MIB_TCPLOSSUNDO;
 		else
@@ -2745,7 +2727,7 @@ static void tcp_try_undo_dsack(struct sock *sk)
 
 	if (tp->undo_marker && !tp->undo_retrans) {
 		DBGUNDO(sk, "D-SACK");
-		tcp_undo_cwr(sk, true);
+		tcp_undo_cwr(sk, 1);
 		tp->undo_marker = 0;
 		NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_TCPDSACKUNDO);
 	}
@@ -2765,9 +2747,9 @@ static void tcp_try_undo_dsack(struct sock *sk)
  * that successive retransmissions of a segment must not advance
  * retrans_stamp under any conditions.
  */
-static int tcp_any_retrans_done(const struct sock *sk)
+static int tcp_any_retrans_done(struct sock *sk)
 {
-	const struct tcp_sock *tp = tcp_sk(sk);
+	struct tcp_sock *tp = tcp_sk(sk);
 	struct sk_buff *skb;
 
 	if (tp->retrans_out)
@@ -2798,7 +2780,7 @@ static int tcp_try_undo_partial(struct sock *sk, int acked)
 		tcp_update_reordering(sk, tcp_fackets_out(tp) + acked, 1);
 
 		DBGUNDO(sk, "Hoe");
-		tcp_undo_cwr(sk, false);
+		tcp_undo_cwr(sk, 0);
 		NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_TCPPARTIALUNDO);
 
 		/* So... Do not make Hoe's retransmit yet.
@@ -2827,7 +2809,7 @@ static int tcp_try_undo_loss(struct sock *sk)
 
 		DBGUNDO(sk, "partial loss");
 		tp->lost_out = 0;
-		tcp_undo_cwr(sk, true);
+		tcp_undo_cwr(sk, 1);
 		NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_TCPLOSSUNDO);
 		inet_csk(sk)->icsk_retransmits = 0;
 		tp->undo_marker = 0;
@@ -2841,15 +2823,8 @@ static int tcp_try_undo_loss(struct sock *sk)
 static inline void tcp_complete_cwr(struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
-
-	/* Do not moderate cwnd if it's already undone in cwr or recovery. */
-	if (tp->undo_marker) {
-		if (inet_csk(sk)->icsk_ca_state == TCP_CA_CWR)
-			tp->snd_cwnd = min(tp->snd_cwnd, tp->snd_ssthresh);
-		else /* PRR */
-			tp->snd_cwnd = tp->snd_ssthresh;
-		tp->snd_cwnd_stamp = tcp_time_stamp;
-	}
+	tp->snd_cwnd = min(tp->snd_cwnd, tp->snd_ssthresh);
+	tp->snd_cwnd_stamp = tcp_time_stamp;
 	tcp_ca_event(sk, CA_EVENT_COMPLETE_CWR);
 }
 
@@ -2907,7 +2882,7 @@ static void tcp_mtup_probe_success(struct sock *sk)
 		       icsk->icsk_mtup.probe_size;
 	tp->snd_cwnd_cnt = 0;
 	tp->snd_cwnd_stamp = tcp_time_stamp;
-	tp->snd_ssthresh = tcp_current_ssthresh(sk);
+	tp->rcv_ssthresh = tcp_current_ssthresh(sk);
 
 	icsk->icsk_mtup.search_low = icsk->icsk_mtup.probe_size;
 	icsk->icsk_mtup.probe_size = 0;
@@ -2963,39 +2938,6 @@ void tcp_simple_retransmit(struct sock *sk)
 	}
 	tcp_xmit_retransmit_queue(sk);
 }
-EXPORT_SYMBOL(tcp_simple_retransmit);
-
-/* This function implements the PRR algorithm, specifcally the PRR-SSRB
- * (proportional rate reduction with slow start reduction bound) as described in
- * http://www.ietf.org/id/draft-mathis-tcpm-proportional-rate-reduction-01.txt.
- * It computes the number of packets to send (sndcnt) based on packets newly
- * delivered:
- *   1) If the packets in flight is larger than ssthresh, PRR spreads the
- *	cwnd reductions across a full RTT.
- *   2) If packets in flight is lower than ssthresh (such as due to excess
- *	losses and/or application stalls), do not perform any further cwnd
- *	reductions, but instead slow start up to ssthresh.
- */
-static void tcp_update_cwnd_in_recovery(struct sock *sk, int newly_acked_sacked,
-					int fast_rexmit, int flag)
-{
-	struct tcp_sock *tp = tcp_sk(sk);
-	int sndcnt = 0;
-	int delta = tp->snd_ssthresh - tcp_packets_in_flight(tp);
-
-	if (tcp_packets_in_flight(tp) > tp->snd_ssthresh) {
-		u64 dividend = (u64)tp->snd_ssthresh * tp->prr_delivered +
-			       tp->prior_cwnd - 1;
-		sndcnt = div_u64(dividend, tp->prior_cwnd) - tp->prr_out;
-	} else {
-		sndcnt = min_t(int, delta,
-			       max_t(int, tp->prr_delivered - tp->prr_out,
-				     newly_acked_sacked) + 1);
-	}
-
-	sndcnt = max(sndcnt, (fast_rexmit ? 1 : 0));
-	tp->snd_cwnd = tcp_packets_in_flight(tp) + sndcnt;
-}
 
 /* Process an event, which can update packets-in-flight not trivially.
  * Main goal of this function is to calculate new estimate for left_out,
@@ -3008,8 +2950,7 @@ static void tcp_update_cwnd_in_recovery(struct sock *sk, int newly_acked_sacked,
  * It does _not_ decide what to send, it is made in function
  * tcp_xmit_retransmit_queue().
  */
-static void tcp_fastretrans_alert(struct sock *sk, int pkts_acked,
-				  int newly_acked_sacked, int flag)
+static void tcp_fastretrans_alert(struct sock *sk, int pkts_acked, int flag)
 {
 	struct inet_connection_sock *icsk = inet_csk(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
@@ -3037,7 +2978,7 @@ static void tcp_fastretrans_alert(struct sock *sk, int pkts_acked,
 	    before(tp->snd_una, tp->high_seq) &&
 	    icsk->icsk_ca_state != TCP_CA_Open &&
 	    tp->fackets_out > tp->reordering) {
-		tcp_mark_head_lost(sk, tp->fackets_out - tp->reordering, 0);
+		tcp_mark_head_lost(sk, tp->fackets_out - tp->reordering);
 		NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_TCPLOSS);
 	}
 
@@ -3159,27 +3100,22 @@ static void tcp_fastretrans_alert(struct sock *sk, int pkts_acked,
 
 		tp->bytes_acked = 0;
 		tp->snd_cwnd_cnt = 0;
-		tp->prior_cwnd = tp->snd_cwnd;
-		tp->prr_delivered = 0;
-		tp->prr_out = 0;
 		tcp_set_ca_state(sk, TCP_CA_Recovery);
 		fast_rexmit = 1;
 	}
 
 	if (do_lost || (tcp_is_fack(tp) && tcp_head_timedout(sk)))
 		tcp_update_scoreboard(sk, fast_rexmit);
-	tp->prr_delivered += newly_acked_sacked;
-	tcp_update_cwnd_in_recovery(sk, newly_acked_sacked, fast_rexmit, flag);
+	tcp_cwnd_down(sk, flag);
 	tcp_xmit_retransmit_queue(sk);
 }
 
-void tcp_valid_rtt_meas(struct sock *sk, u32 seq_rtt)
+static void tcp_valid_rtt_meas(struct sock *sk, u32 seq_rtt)
 {
 	tcp_rtt_estimator(sk, seq_rtt);
 	tcp_set_rto(sk);
 	inet_csk(sk)->icsk_backoff = 0;
 }
-EXPORT_SYMBOL(tcp_valid_rtt_meas);
 
 /* Read draft-ietf-tcplw-high-performance before mucking
  * with this code. (Supersedes RFC1323)
@@ -3246,9 +3182,9 @@ static void tcp_cong_avoid(struct sock *sk, u32 ack, u32 in_flight)
  */
 static void tcp_rearm_rto(struct sock *sk)
 {
-	const struct tcp_sock *tp = tcp_sk(sk);
+	struct tcp_sock *tp = tcp_sk(sk);
 
-	if (!tp->packets_out) {
+	if (!tp->packets_out) {///为0说明所有的传输的段都已经acked。此时remove定时器。否则重启定时器。  
 		inet_csk_clear_xmit_timer(sk, ICSK_TIME_RETRANS);
 	} else {
 		inet_csk_reset_xmit_timer(sk, ICSK_TIME_RETRANS,
@@ -3350,7 +3286,7 @@ static int tcp_clean_rtx_queue(struct sock *sk, int prior_fackets,
 		 * connection startup slow start one packet too
 		 * quickly.  This is severely frowned upon behavior.
 		 */
-		if (!(scb->tcp_flags & TCPHDR_SYN)) {
+		if (!(scb->flags & TCPCB_FLAG_SYN)) {
 			flag |= FLAG_DATA_ACKED;
 		} else {
 			flag |= FLAG_SYN_ACKED;
@@ -3414,7 +3350,7 @@ static int tcp_clean_rtx_queue(struct sock *sk, int prior_fackets,
 						 net_invalid_timestamp()))
 					rtt_us = ktime_us_delta(ktime_get_real(),
 								last_ackt);
-				else if (ca_seq_rtt >= 0)
+				else if (ca_seq_rtt > 0)
 					rtt_us = jiffies_to_usecs(ca_seq_rtt);
 			}
 
@@ -3470,8 +3406,8 @@ static void tcp_ack_probe(struct sock *sk)
 
 static inline int tcp_ack_is_dubious(const struct sock *sk, const int flag)
 {
-	return !(flag & FLAG_NOT_DUP) || (flag & FLAG_CA_ALERT) ||
-		inet_csk(sk)->icsk_ca_state != TCP_CA_Open;
+	return (!(flag & FLAG_NOT_DUP) || (flag & FLAG_CA_ALERT) ||
+		inet_csk(sk)->icsk_ca_state != TCP_CA_Open);
 }
 
 static inline int tcp_may_raise_cwnd(const struct sock *sk, const int flag)
@@ -3488,9 +3424,9 @@ static inline int tcp_may_update_window(const struct tcp_sock *tp,
 					const u32 ack, const u32 ack_seq,
 					const u32 nwin)
 {
-	return	after(ack, tp->snd_una) ||
+	return (after(ack, tp->snd_una) ||
 		after(ack_seq, tp->snd_wl1) ||
-		(ack_seq == tp->snd_wl1 && nwin > tp->snd_wnd);
+		(ack_seq == tp->snd_wl1 && nwin > tp->snd_wnd));
 }
 
 /* Update our send window.
@@ -3498,7 +3434,7 @@ static inline int tcp_may_update_window(const struct tcp_sock *tp,
  * Window update algorithm, described in RFC793/RFC1122 (used in linux-2.2
  * and in FreeBSD. NetBSD's one is even worse.) is wrong.
  */
-static int tcp_ack_update_window(struct sock *sk, const struct sk_buff *skb, u32 ack,
+static int tcp_ack_update_window(struct sock *sk, struct sk_buff *skb, u32 ack,
 				 u32 ack_seq)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
@@ -3558,7 +3494,7 @@ static void tcp_undo_spur_to_response(struct sock *sk, int flag)
 	if (flag & FLAG_ECE)
 		tcp_ratehalving_spur_to_response(sk);
 	else
-		tcp_undo_cwr(sk, true);
+		tcp_undo_cwr(sk, 1);
 }
 
 /* F-RTO spurious RTO detection algorithm (RFC4138)
@@ -3674,7 +3610,13 @@ static int tcp_process_frto(struct sock *sk, int flag)
 }
 
 /* This routine deals with incoming acks, but not outgoing ones. */
-static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
+/*
+ * tcp_ack()用于处理接收到有ACK标志的段，当接到有效的ACK后会更新
+ * 发送窗口。
+ * @skb: 接收到的ACK段
+ * @flag: 标志，取值为FLAG_DATA等
+ */
+static int tcp_ack(struct sock *sk, struct sk_buff *skb, int flag)
 {
 	struct inet_connection_sock *icsk = inet_csk(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
@@ -3684,14 +3626,23 @@ static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
 	u32 prior_in_flight;
 	u32 prior_fackets;
 	int prior_packets;
-	int prior_sacked = tp->sacked_out;
-	int newly_acked_sacked = 0;
 	int frto_cwnd = 0;
 
 	/* If the ack is older than previous acks
 	 * then we can probably ignore it.
 	 */
-	if (before(ack, prior_snd_una))
+	 /*
+	 * 检验确认的序号是否落在SND.UNA和SND.NXT之间，否则
+	 * 是不合法的序号。
+	 * 如果确认的序号在SND.NXT的右边，则说明该序号的数据
+	 * 发送方还没有发送，直接返回。
+	 * 如果确认的序号在SND.UNA的左边，则说明已经接受过
+	 * 该序号的ACK了。因为每个有负载的TCP段都会顺便
+	 * 携带一个ACK序号，即使这个序号已经确认过。因此
+	 * 如果是一个重复的ACK就无需作处理直接返回即可。但
+	 * 如果段中带有SACK选项，则需对此进行处理
+	 */
+	if (before(ack, prior_snd_una)) //说明接收到了重复的ack
 		goto old_ack;
 
 	/* If the ack includes data we haven't sent yet, discard
@@ -3700,7 +3651,7 @@ static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
 	if (after(ack, tp->snd_nxt))
 		goto invalid_ack;
 
-	if (after(ack, prior_snd_una))
+	if (after(ack, prior_snd_una)) //说明收到的是已发送出去包的ack
 		flag |= FLAG_SND_UNA_ADVANCED;
 
 	if (sysctl_tcp_abc) {
@@ -3713,12 +3664,20 @@ static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
 	}
 
 	prior_fackets = tp->fackets_out;
+	/*
+	 * 获取正在传输中的段数
+	 */
 	prior_in_flight = tcp_packets_in_flight(tp);
 
 	if (!(flag & FLAG_SLOWPATH) && after(ack, prior_snd_una)) {
 		/* Window is constant, pure forward advance.
 		 * No more checks are required.
 		 * Note, we use the fact that SND.UNA>=SND.WL2.
+		 */
+		 /*
+		 * 如果接收ACK执行的是快速路径,则更新发送窗口的左边界,
+		 * 添加FLAG_WIN_UPDATE标记,同时通知拥塞控制算法模块
+		 * 本次ACK是快速路径,如有必要,就作相应的处理
 		 */
 		tcp_update_wl(tp, ack_seq);
 		tp->snd_una = ack;
@@ -3728,6 +3687,10 @@ static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
 
 		NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_TCPHPACKS);
 	} else {
+    	/*
+        	 * 如果接收ACK执行的是慢速路径,首先判断ACK段中是否有
+        	 * 数据负载,如果有,则添加FLAG_DATA标记.
+        	 */
 		if (ack_seq != TCP_SKB_CB(skb)->end_seq)
 			flag |= FLAG_DATA;
 		else
@@ -3757,9 +3720,6 @@ static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
 	/* See if we can take anything off of the retransmit queue. */
 	flag |= tcp_clean_rtx_queue(sk, prior_fackets, prior_snd_una);
 
-	newly_acked_sacked = (prior_packets - prior_sacked) -
-			     (tp->packets_out - tp->sacked_out);
-
 	if (tp->frto_counter)
 		frto_cwnd = tcp_process_frto(sk, flag);
 	/* Guarantee sacktag reordering detection against wrap-arounds */
@@ -3772,7 +3732,7 @@ static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
 		    tcp_may_raise_cwnd(sk, flag))
 			tcp_cong_avoid(sk, ack, prior_in_flight);
 		tcp_fastretrans_alert(sk, prior_packets - tp->packets_out,
-				      newly_acked_sacked, flag);
+				      flag);
 	} else {
 		if ((flag & FLAG_DATA_ACKED) && !frto_cwnd)
 			tcp_cong_avoid(sk, ack, prior_in_flight);
@@ -3797,7 +3757,7 @@ invalid_ack:
 	return -1;
 
 old_ack:
-	if (TCP_SKB_CB(skb)->sacked) {
+	if (TCP_SKB_CB(skb)->sacked) {//不为0，说明有携带该选项字段
 		tcp_sacktag_write_queue(sk, skb, prior_snd_una);
 		if (icsk->icsk_ca_state == TCP_CA_Open)
 			tcp_try_keep_open(sk);
@@ -3810,34 +3770,70 @@ old_ack:
 /* Look for tcp options. Normally only called on SYN and SYNACK packets.
  * But, this can also be called on packets in the established flow when
  * the fast version below fails.
+ *//*
+ * tcp_parse_options()解析TCP选项，但通常只在分析SYN和SYN+ACK
+ * 段时被调用，此外慢速路径处理中，如果调用tcp_fast_parse_options()
+ * 失败，也可能在建立连接后调用之。
  */
-void tcp_parse_options(const struct sk_buff *skb, struct tcp_options_received *opt_rx,
-		       const u8 **hvpp, int estab)
+void tcp_parse_options(struct sk_buff *skb, struct tcp_options_received *opt_rx,
+		       u8 **hvpp, int estab)
 {
-	const unsigned char *ptr;
-	const struct tcphdr *th = tcp_hdr(skb);
+	unsigned char *ptr;
+	struct tcphdr *th = tcp_hdr(skb);
+
+	/*
+	 * 如果TCP首部中包含TCP选项，即该首部
+	 * 长度大于不包含TCP选项的普通TCP首部。
+	 */
 	int length = (th->doff * 4) - sizeof(struct tcphdr);
 
-	ptr = (const unsigned char *)(th + 1);
+	ptr = (unsigned char *)(th + 1);
 	opt_rx->saw_tstamp = 0;
 
 	while (length > 0) {
 		int opcode = *ptr++;
 		int opsize;
-
+        /*
+         * 取选项的第二个字节，即kind，根据
+         * 其值分别作处理
+         */
 		switch (opcode) {
+		/*
+		 * TCPOPT_EOL表示选项表结束，因此
+		 * 直接返回
+		 */
 		case TCPOPT_EOL:
 			return;
+
+		/*
+		 * TCPOPT_NOP为空操作，只做填充用，
+		 * 因此选项长度减1，进入下一个
+		 * 循环处理下一个选项
+		 */
 		case TCPOPT_NOP:	/* Ref: RFC 793 section 3.1 */
 			length--;
 			continue;
 		default:
+		    /*
+			 * 如果不是选项表结束标志也不是
+			 * 空操作，则取选项长度，并检测
+			 * 其合法性
+			 */
 			opsize = *ptr++;
 			if (opsize < 2) /* "silly options" */
 				return;
 			if (opsize > length)
 				return;	/* don't parse partial options */
 			switch (opcode) {
+			/*
+			 * TCPOPT_MSS用来通告最大段长度，TCPOPT_MSS
+			 * 宏定义为4，又因为MSS选项只能出现在
+			 * SYN段中，因此判断TCP头部中SYN是否置位，
+			 * 此时调用参数estab应该为0.取最大段长度MSS，
+			 * user_mss是用户以TCP_MAXSEG选项调用setsockopt()
+			 * 设置的，将最大段长度上限值mss_clamp
+			 * 设置为选项中的MSS和user_mss两者中的较小值。
+			 */
 			case TCPOPT_MSS:
 				if (opsize == TCPOLEN_MSS && th->syn && !estab) {
 					u16 in_mss = get_unaligned_be16(ptr);
@@ -3849,9 +3845,24 @@ void tcp_parse_options(const struct sk_buff *skb, struct tcp_options_received *o
 					}
 				}
 				break;
+			/*
+			 * TCPOPT_WINDOW是窗口扩大因子选项，和最大
+			 * 段长度选项一样，也只能出现在SYN段中，
+			 * 因此作同样的判断。
+			 */
 			case TCPOPT_WINDOW:
 				if (opsize == TCPOLEN_WINDOW && th->syn &&
 				    !estab && sysctl_tcp_window_scaling) {
+				    /*
+					 * 取窗口扩大因子选项中的
+					 * 位移数，将表示SYN段中包含
+					 * 扩大因子选项的wscale_ok置为1，
+					 * 如果选项中的位移数大于14则
+					 * 警告，和网络相关的pintk都必须
+					 * 由net_ratelimit来监控。发送窗口
+					 * 扩大因子snd_wscale赋值为位移数和
+					 * 14两者中较小的值。
+					 */
 					__u8 snd_wscale = *(__u8 *)ptr;
 					opt_rx->wscale_ok = 1;
 					if (snd_wscale > 14) {
@@ -3864,6 +3875,9 @@ void tcp_parse_options(const struct sk_buff *skb, struct tcp_options_received *o
 					opt_rx->snd_wscale = snd_wscale;
 				}
 				break;
+			/*
+			 * 时间戳选项
+			 */
 			case TCPOPT_TIMESTAMP:
 				if ((opsize == TCPOLEN_TIMESTAMP) &&
 				    ((estab && opt_rx->tstamp_ok) ||
@@ -3873,6 +3887,13 @@ void tcp_parse_options(const struct sk_buff *skb, struct tcp_options_received *o
 					opt_rx->rcv_tsecr = get_unaligned_be32(ptr + 4);
 				}
 				break;
+			/*
+			 * TCPOPT_SACK_PERM为允许SACK选项，只能出现在
+			 * SYN段中。将sack_ok置为1，表示SYN段中允许
+			 * SACK选项。tcp_sack_reset()将tcp_options_received结构
+			 * 中的三个与SACK有关的字段dsack、eff_sacks和
+			 * num_sacks清零。
+			 */
 			case TCPOPT_SACK_PERM:
 				if (opsize == TCPOLEN_SACK_PERM && th->syn &&
 				    !estab && sysctl_tcp_sack) {
@@ -3881,6 +3902,14 @@ void tcp_parse_options(const struct sk_buff *skb, struct tcp_options_received *o
 				}
 				break;
 
+            /*
+			 * TCPOLEN_SACK_BASE为2，TCPOLEN_SACK_PERBLOCK为8，因此
+			 * if语句的意思是选项长度包含kind、length字段以及
+			 * 一个至多个左右边界值对，且扣除kind和length字段
+			 * 长度后能被左右边界值对大小整除，sack_ok为1表示
+			 * 允许SACK。将tcp_skb_cb的sacked字段指向这些左右边界值
+			 * 对的开始处。
+			 */
 			case TCPOPT_SACK:
 				if ((opsize >= (TCPOLEN_SACK_BASE + TCPOLEN_SACK_PERBLOCK)) &&
 				   !((opsize - TCPOLEN_SACK_BASE) % TCPOLEN_SACK_PERBLOCK) &&
@@ -3927,11 +3956,10 @@ void tcp_parse_options(const struct sk_buff *skb, struct tcp_options_received *o
 		}
 	}
 }
-EXPORT_SYMBOL(tcp_parse_options);
 
-static int tcp_parse_aligned_timestamp(struct tcp_sock *tp, const struct tcphdr *th)
+static int tcp_parse_aligned_timestamp(struct tcp_sock *tp, struct tcphdr *th)
 {
-	const __be32 *ptr = (const __be32 *)(th + 1);
+	__be32 *ptr = (__be32 *)(th + 1);
 
 	if (*ptr == htonl((TCPOPT_NOP << 24) | (TCPOPT_NOP << 16)
 			  | (TCPOPT_TIMESTAMP << 8) | TCPOLEN_TIMESTAMP)) {
@@ -3948,9 +3976,8 @@ static int tcp_parse_aligned_timestamp(struct tcp_sock *tp, const struct tcphdr 
 /* Fast parse options. This hopes to only see timestamps.
  * If it is wrong it falls back on tcp_parse_options().
  */
-static int tcp_fast_parse_options(const struct sk_buff *skb,
-				  const struct tcphdr *th,
-				  struct tcp_sock *tp, const u8 **hvpp)
+static int tcp_fast_parse_options(struct sk_buff *skb, struct tcphdr *th,
+				  struct tcp_sock *tp, u8 **hvpp)
 {
 	/* In the spirit of fast parsing, compare doff directly to constant
 	 * values.  Because equality is used, short doff can be ignored here.
@@ -3971,10 +3998,10 @@ static int tcp_fast_parse_options(const struct sk_buff *skb,
 /*
  * Parse MD5 Signature option
  */
-const u8 *tcp_parse_md5sig_option(const struct tcphdr *th)
+u8 *tcp_parse_md5sig_option(struct tcphdr *th)
 {
-	int length = (th->doff << 2) - sizeof(*th);
-	const u8 *ptr = (const u8 *)(th + 1);
+	int length = (th->doff << 2) - sizeof (*th);
+	u8 *ptr = (u8*)(th + 1);
 
 	/* If the TCP option is too short, we can short cut */
 	if (length < TCPOLEN_MD5SIG)
@@ -3995,14 +4022,13 @@ const u8 *tcp_parse_md5sig_option(const struct tcphdr *th)
 			if (opsize < 2 || opsize > length)
 				return NULL;
 			if (opcode == TCPOPT_MD5SIG)
-				return opsize == TCPOLEN_MD5SIG ? ptr : NULL;
+				return ptr;
 		}
 		ptr += opsize - 2;
 		length -= opsize;
 	}
 	return NULL;
 }
-EXPORT_SYMBOL(tcp_parse_md5sig_option);
 #endif
 
 static inline void tcp_store_ts_recent(struct tcp_sock *tp)
@@ -4051,8 +4077,8 @@ static inline void tcp_replace_ts_recent(struct tcp_sock *tp, u32 seq)
 
 static int tcp_disordered_ack(const struct sock *sk, const struct sk_buff *skb)
 {
-	const struct tcp_sock *tp = tcp_sk(sk);
-	const struct tcphdr *th = tcp_hdr(skb);
+	struct tcp_sock *tp = tcp_sk(sk);
+	struct tcphdr *th = tcp_hdr(skb);
 	u32 seq = TCP_SKB_CB(skb)->seq;
 	u32 ack = TCP_SKB_CB(skb)->ack_seq;
 
@@ -4091,7 +4117,7 @@ static inline int tcp_paws_discard(const struct sock *sk,
  * (borrowed from freebsd)
  */
 
-static inline int tcp_sequence(const struct tcp_sock *tp, u32 seq, u32 end_seq)
+static inline int tcp_sequence(struct tcp_sock *tp, u32 seq, u32 end_seq)
 {
 	return	!before(end_seq, tp->rcv_wup) &&
 		!after(seq, tp->rcv_nxt + tcp_receive_window(tp));
@@ -4136,7 +4162,16 @@ static void tcp_reset(struct sock *sk)
  *
  *	If we are in FINWAIT-2, a received FIN moves us to TIME-WAIT.
  */
-static void tcp_fin(struct sock *sk)
+ /*
+ * 在TCP中还有些地方会通知套接字的faync_list队列
+ * 上的进程。比如，当TCP接收到FIN段后，如果
+ * 此时套接字未在DEAD状态，则唤醒等待该套接
+ * 字的进程。如果在发送接收方向都进行了关闭，
+ * 或者此时该传输控制块处于CLOSE状态，则通知
+ * 异步等待该套接字的进程，该连接已经终止，
+ * 否则通知进程连接可以进行写操作。
+ */
+static void tcp_fin(struct sk_buff *skb, struct sock *sk, struct tcphdr *th)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 
@@ -4145,7 +4180,12 @@ static void tcp_fin(struct sock *sk)
 	sk->sk_shutdown |= RCV_SHUTDOWN;
 	sock_set_flag(sk, SOCK_DONE);
 
-	switch (sk->sk_state) {
+	switch (sk->sk_state) { //状态变迁产考TCP/IP详解18.2
+	/*
+	 * 在SYN_RECV和ESTABLISHED状态，接收到FIN段后，
+	 * 将状态设置为CLOSE_WAIT，并确定延时发送
+	 * ACK
+	 */
 	case TCP_SYN_RECV:
 	case TCP_ESTABLISHED:
 		/* Move to CLOSE_WAIT */
@@ -4153,6 +4193,12 @@ static void tcp_fin(struct sock *sk)
 		inet_csk(sk)->icsk_ack.pingpong = 1;
 		break;
 
+    /*
+     * 在CLOSE_WAIT状态接收到FIN段，则说明
+     * 收到的是重复的FIN段，忽略。
+     * 在CLOSING状态接收FIN段，也将其忽略，
+     * 因为在该状态只需等待ACK。
+     */
 	case TCP_CLOSE_WAIT:
 	case TCP_CLOSING:
 		/* Received a retransmission of the FIN, do
@@ -4163,6 +4209,11 @@ static void tcp_fin(struct sock *sk)
 		/* RFC793: Remain in the LAST-ACK state. */
 		break;
 
+    /*
+	 * 根据TCP状态迁移图，在FIN_WAIT1状态接收
+	 * FIN段，则发送ACK，进入CLOSING状态，并
+	 * 等待对端的ACK
+	 */
 	case TCP_FIN_WAIT1:
 		/* This case occurs when a simultaneous close
 		 * happens, we must ack the received FIN and
@@ -4171,11 +4222,20 @@ static void tcp_fin(struct sock *sk)
 		tcp_send_ack(sk);
 		tcp_set_state(sk, TCP_CLOSING);
 		break;
+
+	/*
+	 * 根据TCP状态迁移图，在FIN_WAIT2状态接收FIN段，
+	 * 则发送ACK，进入TIME_WAIT状态
+	 */
 	case TCP_FIN_WAIT2:
 		/* Received a FIN -- send ACK and enter TIME_WAIT. */
 		tcp_send_ack(sk);
 		tcp_time_wait(sk, TCP_TIME_WAIT, 0);
 		break;
+
+    /*
+	 * 在LISTEN和CLOSE状态忽略FIN段
+	 */
 	default:
 		/* Only TCP_LISTEN and TCP_CLOSE are left, in these
 		 * cases we should never reach this piece of code.
@@ -4188,6 +4248,14 @@ static void tcp_fin(struct sock *sk)
 	/* It _is_ possible, that we have something out-of-order _after_ FIN.
 	 * Probably, we should reset in this case. For now drop them.
 	 */
+	/*
+	 * 如果此时套接字未处于DEAD状态，则唤醒
+	 * 等待该套接字的进程。如果在发送接收
+	 * 方向上都进行了关闭，或此时该传输控制
+	 * 块处于CLOSE状态，则唤醒异步等待该套接字
+	 * 的进程，通知它们该链接已终止，否则通知
+	 * 它们连接可以进行写操作
+	 */ //被动断开的一方在收到FIN的时候，内核要通知给应用程序
 	__skb_queue_purge(&tp->out_of_order_queue);
 	if (tcp_is_sack(tp))
 		tcp_sack_reset(&tp->rx_opt);
@@ -4248,7 +4316,7 @@ static void tcp_dsack_extend(struct sock *sk, u32 seq, u32 end_seq)
 		tcp_sack_extend(tp->duplicate_sack, seq, end_seq);
 }
 
-static void tcp_send_dupack(struct sock *sk, const struct sk_buff *skb)
+static void tcp_send_dupack(struct sock *sk, struct sk_buff *skb)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 
@@ -4407,7 +4475,7 @@ static void tcp_ofo_queue(struct sock *sk)
 		__skb_queue_tail(&sk->sk_receive_queue, skb);
 		tp->rcv_nxt = TCP_SKB_CB(skb)->end_seq;
 		if (tcp_hdr(skb)->fin)
-			tcp_fin(sk);
+			tcp_fin(skb, sk, tcp_hdr(skb));
 	}
 }
 
@@ -4435,7 +4503,7 @@ static inline int tcp_try_rmem_schedule(struct sock *sk, unsigned int size)
 
 static void tcp_data_queue(struct sock *sk, struct sk_buff *skb)
 {
-	const struct tcphdr *th = tcp_hdr(skb);
+	struct tcphdr *th = tcp_hdr(skb);
 	struct tcp_sock *tp = tcp_sk(sk);
 	int eaten = -1;
 
@@ -4470,7 +4538,7 @@ static void tcp_data_queue(struct sock *sk, struct sk_buff *skb)
 			if (!skb_copy_datagram_iovec(skb, 0, tp->ucopy.iov, chunk)) {
 				tp->ucopy.len -= chunk;
 				tp->copied_seq += chunk;
-				eaten = (chunk == skb->len);
+				eaten = (chunk == skb->len && !th->fin);
 				tcp_rcv_space_adjust(sk);
 			}
 			local_bh_disable();
@@ -4489,7 +4557,7 @@ queue_and_out:
 		if (skb->len)
 			tcp_event_data_recv(sk, skb);
 		if (th->fin)
-			tcp_fin(sk);
+			tcp_fin(skb, sk, th);
 
 		if (!skb_queue_empty(&tp->out_of_order_queue)) {
 			tcp_ofo_queue(sk);
@@ -4919,9 +4987,9 @@ void tcp_cwnd_application_limited(struct sock *sk)
 	tp->snd_cwnd_stamp = tcp_time_stamp;
 }
 
-static int tcp_should_expand_sndbuf(const struct sock *sk)
+static int tcp_should_expand_sndbuf(struct sock *sk)
 {
-	const struct tcp_sock *tp = tcp_sk(sk);
+	struct tcp_sock *tp = tcp_sk(sk);
 
 	/* If the user specified a specific send buffer setting, do
 	 * not modify it.
@@ -4934,7 +5002,7 @@ static int tcp_should_expand_sndbuf(const struct sock *sk)
 		return 0;
 
 	/* If we are under soft global TCP memory pressure, do not expand.  */
-	if (atomic_long_read(&tcp_memory_allocated) >= sysctl_tcp_mem[0])
+	if (atomic_read(&tcp_memory_allocated) >= sysctl_tcp_mem[0])
 		return 0;
 
 	/* If we filled the congestion window, do not expand.  */
@@ -4955,10 +5023,8 @@ static void tcp_new_space(struct sock *sk)
 	struct tcp_sock *tp = tcp_sk(sk);
 
 	if (tcp_should_expand_sndbuf(sk)) {
-		int sndmem = SKB_TRUESIZE(max_t(u32,
-						tp->rx_opt.mss_clamp,
-						tp->mss_cache) +
-					  MAX_TCP_HEADER);
+		int sndmem = max_t(u32, tp->rx_opt.mss_clamp, tp->mss_cache) +
+			MAX_TCP_HEADER + 16 + sizeof(struct sk_buff);
 		int demanded = max_t(unsigned int, tp->snd_cwnd,
 				     tp->reordering + 1);
 		sndmem *= 2 * demanded;
@@ -5030,7 +5096,7 @@ static inline void tcp_ack_snd_check(struct sock *sk)
  *	either form (or just set the sysctl tcp_stdurg).
  */
 
-static void tcp_check_urg(struct sock *sk, const struct tcphdr *th)
+static void tcp_check_urg(struct sock *sk, struct tcphdr *th)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	u32 ptr = ntohs(th->urg_ptr);
@@ -5096,7 +5162,7 @@ static void tcp_check_urg(struct sock *sk, const struct tcphdr *th)
 }
 
 /* This is the 'fast' part of urgent handling. */
-static void tcp_urg(struct sock *sk, struct sk_buff *skb, const struct tcphdr *th)
+static void tcp_urg(struct sock *sk, struct sk_buff *skb, struct tcphdr *th)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 
@@ -5105,7 +5171,7 @@ static void tcp_urg(struct sock *sk, struct sk_buff *skb, const struct tcphdr *t
 		tcp_check_urg(sk, th);
 
 	/* Do we wait for any urgent data? - normally not... */
-	if (tp->urg_data == TCP_URG_NOTYET) {
+	if (tp->urg_data == TCP_URG_NOTYET) { //在上面的tcp_check_urg中如果有urg数据则会赋值
 		u32 ptr = tp->urg_seq - ntohl(th->seq) + (th->doff * 4) -
 			  th->syn;
 
@@ -5159,6 +5225,13 @@ static __sum16 __tcp_checksum_complete_user(struct sock *sk,
 	return result;
 }
 
+/*
+ * tcp_checksum_complete和tcp_checksum_complete_user都是基于伪首部累加和
+ * 完成全包校验和的检测。不同之处在于，前者用于校验没有负载的TCP段，而后者
+ * 用于校验在ESTABLISHED状态下接收到的段，虽然这两个函数最后都调用
+ * __tcp_checksum_complete完成校验，但是在ESTABLISHED状态下涉及传输控制块
+ * 是否被进程锁定
+ */
 static inline int tcp_checksum_complete_user(struct sock *sk,
 					     struct sk_buff *skb)
 {
@@ -5217,14 +5290,18 @@ out:
  * play significant role here.
  */
 static int tcp_validate_incoming(struct sock *sk, struct sk_buff *skb,
-			      const struct tcphdr *th, int syn_inerr)
+			      struct tcphdr *th, int syn_inerr)
 {
-	const u8 *hash_location;
 	struct tcp_sock *tp = tcp_sk(sk);
 
 	/* RFC1323: H1. Apply PAWS check first. */
-	if (tcp_fast_parse_options(skb, th, tp, &hash_location) &&
-	    tp->rx_opt.saw_tstamp &&
+	/*
+	 * 调用tcp_fast_parse_options()解析TCP选项，并检查时间戳
+	 * 选项。如果首部中存在时间戳，但PAWS校验失败，
+	 * 并且不存在RST标志则还还需发送DACK给对端，说明
+	 * 接收到的TCP段已确认过，然后丢弃该数据包
+	 */
+	if (tcp_fast_parse_options(skb, th, tp) && tp->rx_opt.saw_tstamp &&
 	    tcp_paws_discard(sk, skb)) {
 		if (!th->rst) {
 			NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_PAWSESTABREJECTED);
@@ -5235,6 +5312,13 @@ static int tcp_validate_incoming(struct sock *sk, struct sk_buff *skb,
 	}
 
 	/* Step 1: check sequence number */
+	/*
+	 * 调用tcp_sequence()检测接收到的段序号是否在
+	 * 接收窗口内，如果不是，则丢弃该数据包。
+	 * 如果不是复位段(TCP首部中有RST标志)则还
+	 * 需发送DACK给对端，说明接收到的TCP段不在
+	 * 接收窗口内。
+	 */
 	if (!tcp_sequence(tp, TCP_SKB_CB(skb)->seq, TCP_SKB_CB(skb)->end_seq)) {
 		/* RFC793, page 37: "In all states except SYN-SENT, all reset
 		 * (RST) segments are validated by checking their SEQ-fields."
@@ -5248,6 +5332,10 @@ static int tcp_validate_incoming(struct sock *sk, struct sk_buff *skb,
 	}
 
 	/* Step 2: check RST bit */
+	/*
+	 * 如果接收的段是复位段，则处理完
+	 * 复位后丢弃该段。
+	 */
 	if (th->rst) {
 		tcp_reset(sk);
 		goto discard;
@@ -5256,11 +5344,19 @@ static int tcp_validate_incoming(struct sock *sk, struct sk_buff *skb,
 	/* ts_recent update must be made after we are sure that the packet
 	 * is in window.
 	 */
+	/*
+	 * 如果TCP首部中存在时间戳选项且有效，
+	 * 则保存该时间戳
+	 */
 	tcp_replace_ts_recent(tp, TCP_SKB_CB(skb)->seq);
 
 	/* step 3: check security and precedence [ignored] */
 
 	/* step 4: Check for a SYN in window. */
+	/*
+	 * 已建立连接的TCP接收到SYN段，则说明对端
+	 * 发送了错误的信息，调用tcp_reset()作复位处理。
+	 */
 	if (th->syn && !before(TCP_SKB_CB(skb)->seq, tp->rcv_nxt)) {
 		if (syn_inerr)
 			TCP_INC_STATS_BH(sock_net(sk), TCP_MIB_INERRS);
@@ -5298,9 +5394,12 @@ discard:
  *	The first three cases are guaranteed by proper pred_flags setting,
  *	the rest is checked inline. Fast processing is turned on in
  *	tcp_data_queue when everything is OK.
- */
+ *//*
+	 * 如果传输控制块的状态为TCP_ESTABLISHED，则
+	 * 调用tcp_rcv_established()接收处理。
+	 */
 int tcp_rcv_established(struct sock *sk, struct sk_buff *skb,
-			const struct tcphdr *th, unsigned int len)
+			struct tcphdr *th, unsigned len)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	int res;
@@ -5508,12 +5607,350 @@ discard:
 	__kfree_skb(skb);
 	return 0;
 }
-EXPORT_SYMBOL(tcp_rcv_established);
 
+/*
+ * 在SYN_SENT状态下接收到的段,除紧急数据外其他的都由
+ * tcp_rcv_state_process()处理,以下代码显示的是SYN_SENT状态下接
+ * 收处理SYN+ACK段的情况.
+ */ //客户端发送SYN后，收到SYN+ACK或者对端SYN(也就是两端同时发送SYN)的情况。
 static int tcp_rcv_synsent_state_process(struct sock *sk, struct sk_buff *skb,
-					 const struct tcphdr *th, unsigned int len)
+					 struct tcphdr *th, unsigned len)
 {
-	const u8 *hash_location;
+	struct tcp_sock *tp = tcp_sk(sk);
+	struct inet_connection_sock *icsk = inet_csk(sk);
+	int saved_clamp = tp->rx_opt.mss_clamp;
+
+	/*
+	 * 解析段中的TCP选项,并保存到传输控制块中.
+	 */
+	tcp_parse_options(skb, &tp->rx_opt, 0);
+
+	if (th->ack) {
+		/* rfc793:
+		 * "If the state is SYN-SENT then
+		 *    first check the ACK bit
+		 *      If the ACK bit is set
+		 *	  If SEG.ACK =< ISS, or SEG.ACK > SND.NXT, send
+		 *        a reset (unless the RST bit is set, if so drop
+		 *        the segment and return)"
+		 *
+		 *  We do not send data with SYN, so that RFC-correct
+		 *  test reduces to:
+		 */
+		if (TCP_SKB_CB(skb)->ack_seq != tp->snd_nxt)//
+			goto reset_and_undo;
+
+		if (tp->rx_opt.saw_tstamp && tp->rx_opt.rcv_tsecr &&
+		    !between(tp->rx_opt.rcv_tsecr, tp->retrans_stamp,
+			     tcp_time_stamp)) {
+			NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_PAWSACTIVEREJECTED);
+			goto reset_and_undo;
+		}
+
+		/* Now ACK is acceptable.
+		 *
+		 * "If the RST bit is set
+		 *    If the ACK was acceptable then signal the user "error:
+		 *    connection reset", drop the segment, enter CLOSED state,
+		 *    delete TCB, and return."
+		 */
+
+		/*
+		 * 在SYN_SENT状态下接收到了ACK+RST段,需调用tcp_reset()
+		 * 设置ECONNREFUSED错误码,同时通知等待该套接字的
+		 * 进程,然后关闭该套接字.
+		 */
+		if (th->rst) {
+			tcp_reset(sk);
+			goto discard;
+		}
+
+		/* rfc793:
+		 *   "fifth, if neither of the SYN or RST bits is set then
+		 *    drop the segment and return."
+		 *
+		 *    See note below!
+		 *                                        --ANK(990513)
+		 */
+		/*
+		 * 在SYN_SENT状态下接收到的段必须存在SYN标志,否则
+		 * 说明接收到的段无效,需跳转到discard_and_undo处执行,
+		 * 清除解析得到的TCP选项,然后丢弃该段.
+		 */
+		if (!th->syn)
+			goto discard_and_undo;
+
+		/* rfc793:
+		 *   "If the SYN bit is on ...
+		 *    are acceptable then ...
+		 *    (our SYN has been ACKed), change the connection
+		 *    state to ESTABLISHED..."
+		 */
+		/*
+		 * 从TCP首部标志中获取支持显式拥塞通知的特性.
+		 * 对于支持ECN的TCP段来说,SYN的ACK只设置ECE标志.
+		 * 如果接收到的段与之不符,表示对端不支持显式
+		 * 拥塞通知.
+		 */
+		TCP_ECN_rcv_synack(tp, th);
+
+		/*
+		 * 初始化与窗口有关的成员变量.
+		 */
+		tp->snd_wl1 = TCP_SKB_CB(skb)->seq;
+		tcp_ack(sk, skb, FLAG_SLOWPATH);
+
+		/* Ok.. it's good. Set up sequence numbers and
+		 * move to established.
+		 */
+		tp->rcv_nxt = TCP_SKB_CB(skb)->seq + 1;
+		tp->rcv_wup = TCP_SKB_CB(skb)->seq + 1;
+
+		/* RFC1323: The window in SYN & SYN/ACK segments is
+		 * never scaled.
+		 */
+		tp->snd_wnd = ntohs(th->window);
+		tcp_init_wl(tp, TCP_SKB_CB(skb)->seq);
+
+		if (!tp->rx_opt.wscale_ok) {
+			tp->rx_opt.snd_wscale = tp->rx_opt.rcv_wscale = 0;
+			tp->window_clamp = min(tp->window_clamp, 65535U);
+		}
+
+		/*
+		 * 根据是否支持时间戳选项来设置传输控制块
+		 * 的相关字段.
+		 */
+		if (tp->rx_opt.saw_tstamp) {
+			tp->rx_opt.tstamp_ok	   = 1;
+			tp->tcp_header_len =
+				sizeof(struct tcphdr) + TCPOLEN_TSTAMP_ALIGNED;//如果在协商的时候TCP选项字段中支持时间戳选项，则以后的报文中都会带这个选项，所以tcp长度一直加了这个值
+			tp->advmss	    -= TCPOLEN_TSTAMP_ALIGNED;//减这个是因为报文里面一直多了时间搓选项
+			tcp_store_ts_recent(tp);
+		} else {
+			tp->tcp_header_len = sizeof(struct tcphdr);
+		}
+
+		/*
+		 * 初始化PMTU、MSS等成员变量。
+		 */
+		if (tcp_is_sack(tp) && sysctl_tcp_fack)
+			tcp_enable_fack(tp);
+
+		tcp_mtup_init(sk);
+		tcp_sync_mss(sk, icsk->icsk_pmtu_cookie);
+		tcp_initialize_rcv_mss(sk);
+
+		/* Remember, tcp_poll() does not lock socket!
+		 * Change state from SYN-SENT only after copied_seq
+		 * is initialized. */
+		tp->copied_seq = tp->rcv_nxt;
+		smp_mb();
+		tcp_set_state(sk, TCP_ESTABLISHED);
+
+		security_inet_conn_established(sk, skb);
+
+		/* Make sure socket is routed, for correct metrics.  */
+		icsk->icsk_af_ops->rebuild_header(sk);
+
+		tcp_init_metrics(sk);
+
+		tcp_init_congestion_control(sk);
+
+		/* Prevent spurious tcp_cwnd_restart() on first data
+		 * packet.
+		 */
+		tp->lsndtime = tcp_time_stamp;
+
+		tcp_init_buffer_space(sk);
+
+		/*
+		 * 如果启用了连接保活，则启用连接保活
+		 * 定时器。
+		 */
+		if (sock_flag(sk, SOCK_KEEPOPEN))
+			inet_csk_reset_keepalive_timer(sk, keepalive_time_when(tp));
+
+		/*
+		 * 设置首部预测标志。
+		 */
+		if (!tp->rx_opt.snd_wscale)
+			__tcp_fast_path_on(tp, tp->snd_wnd);
+		else
+			tp->pred_flags = 0;
+
+		/*
+		 * 如果套接字不处于SOCK_DEAD状态，则唤醒等待该
+		 * 套接字的进程，同时向套接字的异步等待列表
+		 * 上的进程发送信号，通知它们该套接字可以输
+		 * 出数据了。
+		 */
+		if (!sock_flag(sk, SOCK_DEAD)) {
+			sk->sk_state_change(sk);
+			sk_wake_async(sk, SOCK_WAKE_IO, POLL_OUT);
+		}
+
+		/*
+		 * 连接建立完成，根据情况进入延时确认模式
+		 */
+		if (sk->sk_write_pending ||
+		    icsk->icsk_accept_queue.rskq_defer_accept ||
+		    icsk->icsk_ack.pingpong) {
+			/* Save one ACK. Data will be ready after
+			 * several ticks, if write_pending is set.
+			 *
+			 * It may be deleted, but with this feature tcpdumps
+			 * look so _wonderfully_ clever, that I was not able
+			 * to stand against the temptation 8)     --ANK
+			 */
+			inet_csk_schedule_ack(sk);
+			icsk->icsk_ack.lrcvtime = tcp_time_stamp;
+			icsk->icsk_ack.ato	 = TCP_ATO_MIN;
+			tcp_incr_quickack(sk);
+			tcp_enter_quickack_mode(sk);
+			inet_csk_reset_xmit_timer(sk, ICSK_TIME_DACK,
+						  TCP_DELACK_MAX, TCP_RTO_MAX);
+
+discard:
+			__kfree_skb(skb);
+			return 0;
+		} else {
+			tcp_send_ack(sk);
+		}
+		return -1;
+	}
+
+	/* No ACK in the segment */
+	/*
+	 * 在SYN_SENT状态下如果接收到RST段，则跳转到
+	 * discard_and_undo处，清除解析得到的TCP选项，并
+	 * 将传输控制块丢弃。
+	 */
+	if (th->rst) {
+		/* rfc793:
+		 * "If the RST bit is set
+		 *
+		 *      Otherwise (no ACK) drop the segment and return."
+		 */
+
+		goto discard_and_undo;
+	}
+
+	/* PAWS check. */
+	/*
+	 * 如果PAWS检测无效，则跳转到discard_and_undo处，
+	 * 清除解析得到的TCP选项，并将传输控制块
+	 * 丢弃。
+	 */
+	if (tp->rx_opt.ts_recent_stamp && tp->rx_opt.saw_tstamp &&
+	    tcp_paws_reject(&tp->rx_opt, 0))
+		goto discard_and_undo;
+
+	/*
+	 * 处理接收没有ACK标志的SYN段，处理同时打开的
+	 * 情况。
+	 * 
+	 * 同时打开情况如下:
+	 * 每一段必须发送一个SYN，且这两个SYN必须都传
+	 * 递到对端，这需要每一端都使用一个对端熟知
+	 * 的端口作为本地端口，这称为同时打开。
+	 * 当出现同时打开情况时，两端几乎在同时发送
+	 * SYN并进入SYN_SENT状态；当每一端接收到SYN后状
+	 * 态变为SYN_RECVD，发送SYN并对收到的SYN进行确认；
+	 * 当双方都收到对端的SYN及相应的ACK，状态变迁
+	 * 为ESTABLISHED。
+	 */
+	if (th->syn) {//同时打开，见樊东东 下P828
+		/* We see SYN without ACK. It is attempt of
+		 * simultaneous connect with crossed SYNs.
+		 * Particularly, it can be connect to self.
+		 */
+		/*
+		 * 在SYN_SENT状态下接收到SYN段，将其状态
+		 * 设置为SYN_RECV。
+		 */
+		tcp_set_state(sk, TCP_SYN_RECV);
+
+		/*
+		 * 根据是否支持时间戳选项，设置TCP
+		 * 传输控制块相应的字段。
+		 */
+		if (tp->rx_opt.saw_tstamp) {
+			tp->rx_opt.tstamp_ok = 1;
+			tcp_store_ts_recent(tp);
+			tp->tcp_header_len =
+				sizeof(struct tcphdr) + TCPOLEN_TSTAMP_ALIGNED;
+		} else {
+			tp->tcp_header_len = sizeof(struct tcphdr);
+		}
+
+		/*
+		 * 初始化窗口相关的成员变量。
+		 */
+		tp->rcv_nxt = TCP_SKB_CB(skb)->seq + 1;
+		tp->rcv_wup = TCP_SKB_CB(skb)->seq + 1;
+
+		/* RFC1323: The window in SYN & SYN/ACK segments is
+		 * never scaled.
+		 */
+		tp->snd_wnd    = ntohs(th->window);
+		tp->snd_wl1    = TCP_SKB_CB(skb)->seq;
+		tp->max_window = tp->snd_wnd;
+
+		/*
+		 * 从TCP首部标志中获取支持显式拥塞通知的特性。
+		 * 对于支持ECN的TCP端来说，SYN段TCP首部中有设置
+		 * ECE及CWR标志，接收到的段中有任何一个标志来
+		 * 设置，都表示对端不支持显式拥塞通知。
+		 */
+		TCP_ECN_rcv_syn(tp, th);
+
+		/*
+		 * 初始化PMTU、MSS等成员变量。
+		 */
+		tcp_mtup_init(sk);
+		tcp_sync_mss(sk, icsk->icsk_pmtu_cookie);
+		tcp_initialize_rcv_mss(sk);
+
+		/*
+		 * 最后发送SYN+ACK段给对端，并丢弃接收到的
+		 * SYN段。
+		 */
+		tcp_send_synack(sk);
+#if 0
+		/* Note, we could accept data and URG from this segment.
+		 * There are no obstacles to make this.
+		 *
+		 * However, if we ignore data in ACKless segments sometimes,
+		 * we have no reasons to accept it sometimes.
+		 * Also, seems the code doing it in step6 of tcp_rcv_state_process
+		 * is not flawless. So, discard packet for sanity.
+		 * Uncomment this return to process the data.
+		 */
+		return -1;
+#else
+		goto discard;
+#endif
+	}
+	/* "fifth, if neither of the SYN or RST bits is set then
+	 * drop the segment and return."
+	 */
+
+discard_and_undo:
+	tcp_clear_options(&tp->rx_opt);
+	tp->rx_opt.mss_clamp = saved_clamp;
+	goto discard;
+
+reset_and_undo:
+	tcp_clear_options(&tp->rx_opt);
+	tp->rx_opt.mss_clamp = saved_clamp;
+	return 1;
+}
+
+static int tcp_rcv_synsent_state_process1(struct sock *sk, struct sk_buff *skb,
+					 struct tcphdr *th, unsigned len)
+{
+	u8 *hash_location;
 	struct inet_connection_sock *icsk = inet_csk(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct tcp_cookie_values *cvp = tp->cookie_values;
@@ -5598,8 +6035,8 @@ static int tcp_rcv_synsent_state_process(struct sock *sk, struct sk_buff *skb,
 		if (tp->rx_opt.saw_tstamp) {
 			tp->rx_opt.tstamp_ok	   = 1;
 			tp->tcp_header_len =
-				sizeof(struct tcphdr) + TCPOLEN_TSTAMP_ALIGNED;
-			tp->advmss	    -= TCPOLEN_TSTAMP_ALIGNED;
+				sizeof(struct tcphdr) + TCPOLEN_TSTAMP_ALIGNED;//如果在协商的时候TCP选项字段中支持时间戳选项，则以后的报文中都会带这个选项，所以tcp长度一直加了这个值
+			tp->advmss	    -= TCPOLEN_TSTAMP_ALIGNED;//减这个是因为报文里面一直多了时间搓选项
 			tcp_store_ts_recent(tp);
 		} else {
 			tp->tcp_header_len = sizeof(struct tcphdr);
@@ -5786,9 +6223,9 @@ reset_and_undo:
  *	It's called from both tcp_v4_rcv and tcp_v6_rcv and should be
  *	address independent.
  */
-
+//这里说明在连接建立的过程中只能是客户端收到SYN+ACK,或者是服务器端收到SYN。连接断开的过程也会走到这里面
 int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
-			  const struct tcphdr *th, unsigned int len)
+			  struct tcphdr *th, unsigned len)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct inet_connection_sock *icsk = inet_csk(sk);
@@ -5801,7 +6238,13 @@ int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
 	case TCP_CLOSE:
 		goto discard;
 
-	case TCP_LISTEN:
+	case TCP_LISTEN://服务器端收到SYN
+	    /*
+		 * 在半连接的LISTEN状态下，只处理SYN段。如果是
+		 * ACK段，此时连接尚未开始建立，因此返回1。在调用
+		 * tcp_rcv_state_process()函数中会给对方发送RST段；
+		 * 如果接收的是RST段，则丢弃
+		 */
 		if (th->ack)
 			return 1;
 
@@ -5809,7 +6252,11 @@ int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
 			goto discard;
 
 		if (th->syn) {
-			if (icsk->icsk_af_ops->conn_request(sk, skb) < 0)
+		    /*
+			 * 处理SYN段，主要由conn_request接口(TCP中为tcp_v4_conn_request)处理，
+			 * icsk_af_ops成员在创建套接字时被初始化，参见tcp_v4_init_sock()
+			 */
+			if (icsk->icsk_af_ops->conn_request(sk, skb) < 0) //收到三次握手的第一步SYN，则在tcp_v4_conn_request中创建连接请求控制块request_sock
 				return 1;
 
 			/* Now we have several options: In theory there is
@@ -5830,20 +6277,30 @@ int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
 			 * it's still in use.
 			 */
 			kfree_skb(skb);
-			return 0;
+			return 0;//注意这里返回出去了
 		}
 		goto discard;
 
-	case TCP_SYN_SENT:
+	case TCP_SYN_SENT://客户端收到SYN+ACK
+	    /*
+		 * 处理SYN_SENT状态下接收到的TCP段,如果返回值大于0
+		 * 则表示需给对方发送RST段,该TCP段的释放由
+		 * tcp_rcv_state_process()的调用者来处理.
+		 */
 		queued = tcp_rcv_synsent_state_process(sk, skb, th, len);
 		if (queued >= 0)
 			return queued;
 
 		/* Do step6 onward by hand. */
+		/*
+		 * 在处理了SYN_SENT状态下接收到的段之后,还
+		 * 需处理紧急数据,然后释放该段,最后检测是
+		 * 否有数据需要发送.
+		 */
 		tcp_urg(sk, skb, th);
 		__kfree_skb(skb);
 		tcp_data_snd_check(sk);
-		return 0;
+		return 0;//注意这里返回出去了
 	}
 
 	res = tcp_validate_incoming(sk, skb, th, 0);
@@ -5852,11 +6309,18 @@ int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
 
 	/* step 5: check the ACK field */
 	if (th->ack) {
+	    /*
+		 * 处理TCP段ACK标志，tcp_ack()返回非零值表示处理
+		 * ACK段成功，是正常的第三次握手TCP段
+		 */
 		int acceptable = tcp_ack(sk, skb, FLAG_SLOWPATH) > 0;
-
+    
 		switch (sk->sk_state) {
-		case TCP_SYN_RECV:
+		case TCP_SYN_RECV: //这里是由tcp_v4_do_rcv里面的tcp_child_process走到这里，在tcp_child_process前会通过tcp_v4_hnd_req创建一个新的struct sock
 			if (acceptable) {
+			    /*
+				 * 设置"子"传输控制块为ESTABLISHED状态
+				 */
 				tp->copied_seq = tp->rcv_nxt;
 				smp_mb();
 				tcp_set_state(sk, TCP_ESTABLISHED);
@@ -5867,14 +6331,28 @@ int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
 				 * are not waked up, because sk->sk_sleep ==
 				 * NULL and sk->sk_socket == NULL.
 				 */
+				/*
+				 * 发信号给那些将通过该套接字发送数据的进程，
+				 * 通知他们套接字目前已经可以发送数据了
+				 */
 				if (sk->sk_socket)
 					sk_wake_async(sk,
 						      SOCK_WAKE_IO, POLL_OUT);
 
+                /*
+				 * 初始化传输控制块各字段，如果存在时间戳选项，
+				 * 同时平滑RTT为零，则需计算重传超时时间等
+				 */
 				tp->snd_una = TCP_SKB_CB(skb)->ack_seq;
 				tp->snd_wnd = ntohs(th->window) <<
 					      tp->rx_opt.snd_wscale;
 				tcp_init_wl(tp, TCP_SKB_CB(skb)->seq);
+
+				/* tcp_ack considers this ACK as duplicate
+				 * and does not calculate rtt.
+				 * Force it here.
+				 */
+				tcp_ack_update_rtt(sk, 0, 0);
 
 				if (tp->rx_opt.tstamp_ok)
 					tp->advmss -= TCPOLEN_TSTAMP_ALIGNED;
@@ -5882,20 +6360,30 @@ int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
 				/* Make sure socket is routed, for
 				 * correct metrics.
 				 */
+				/*
+				 * 为该套接字建立路由，初始化拥塞控制模块
+				 */
 				icsk->icsk_af_ops->rebuild_header(sk);
-
 				tcp_init_metrics(sk);
-
 				tcp_init_congestion_control(sk);
 
 				/* Prevent spurious tcp_cwnd_restart() on
 				 * first data packet.
+				 *//*
+				 * 更新最近一次发送数据包的时间
 				 */
 				tp->lsndtime = tcp_time_stamp;
 
+                /*
+				 * 初始化与路径MTU有关的成员
+				 */
 				tcp_mtup_init(sk);
 				tcp_initialize_rcv_mss(sk);
 				tcp_init_buffer_space(sk);
+
+				/*
+				 * 计算有关TCP首部预测的标志
+				 */
 				tcp_fast_path_on(tp);
 			} else {
 				return 1;
@@ -5904,16 +6392,42 @@ int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
 
 		case TCP_FIN_WAIT1:
 			if (tp->snd_una == tp->write_seq) {
-				tcp_set_state(sk, TCP_FIN_WAIT2);
+			    /*
+				 * 如果通过ACK的确认，所有的发送
+				 * 段(包括FIN段)对方都已收到，则
+				 * 从FIN_WAIT1状态迁移到FIN_WAINT2状态，
+				 * 并关闭发送方向的连接。
+				 */
+				tcp_set_state(sk, TCP_FIN_WAIT2);//这里设置里进入WAIT2状态
 				sk->sk_shutdown |= SEND_SHUTDOWN;
+
+				/*
+				 * 因为从对端接收到ACK段，因此可以
+				 * 确认此路由缓存有效
+				 */
 				dst_confirm(__sk_dst_get(sk));
 
 				if (!sock_flag(sk, SOCK_DEAD))
 					/* Wake up lingering close() */
+					/*
+					 * 如果套接字不在SOCK_DEAD状态，由于
+					 * TCP状态发生了变化，因此唤醒那些
+					 * 等待本套接字的进程.
+					 * 这里应该是唤醒tcp_close()中设置了SOCK_LINGER标志后
+					 * 需要等待的进程。
+					 */
 					sk->sk_state_change(sk);
 				else {
 					int tmo;
 
+                    /*
+					 * 如果套接字处于SOCK_DEAD状态，则需
+					 * 关闭传输控制块，或者在FIN_WAIT2
+					 * 状态等待。
+					 * 如果linger2小于0，则说明无需在
+					 * FIN_WAIT2状态等待，直接关闭传输
+					 * 控制块
+					 */
 					if (tp->linger2 < 0 ||
 					    (TCP_SKB_CB(skb)->end_seq != TCP_SKB_CB(skb)->seq &&
 					     after(TCP_SKB_CB(skb)->end_seq - th->fin, tp->rcv_nxt))) {
@@ -5921,10 +6435,15 @@ int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
 						NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_TCPABORTONDATA);
 						return 1;
 					}
-
+                    /*
+                        sock结构进入TIME_WAIT状态有两种情况：一种是在真正进入了TIME_WAIT状态，还有一种是真实的状态是FIN_WAIT_2的TIME_WAIT状态。
+                        之所以让FIN_WAIT_2状态在没有接收到FIN包的情况下也可以进入TIME_WAIT状态是因为tcp_sock结构占用的资源要比tcp_timewait_sock
+                        结构占用的资源多，而且在TIME_WAIT下也可以处理连接的关闭。
+                        */
 					tmo = tcp_fin_time(sk);
-					if (tmo > TCP_TIMEWAIT_LEN) {
-						inet_csk_reset_keepalive_timer(sk, tmo - TCP_TIMEWAIT_LEN);
+					//这里说明了:主动关闭的一端在等待三次握手中的第三步FIN的时候，不会永远等待，如果对端等tmo还没发送FIN过来，则直接进入time_wait定时器tcp_time_wait(这里面会把之前的sk释放掉，用心的timewait_sock替换)超时阶段
+					if (tmo > TCP_TIMEWAIT_LEN) { 
+						inet_csk_reset_keepalive_timer(sk, tmo - TCP_TIMEWAIT_LEN);//超过TCP_TIMEWAIT_LEN的时间在keepalive中实现，然后在在该keepalive定时器回调中进入tcp_time_wait
 					} else if (th->fin || sock_owned_by_user(sk)) {
 						/* Bad case. We could lose such FIN otherwise.
 						 * It is not a big problem, but it looks confusing
@@ -5932,9 +6451,9 @@ int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
 						 * if it spins in bh_lock_sock(), but it is really
 						 * marginal case.
 						 */
-						inet_csk_reset_keepalive_timer(sk, tmo);
+						inet_csk_reset_keepalive_timer(sk, tmo);//
 					} else {
-						tcp_time_wait(sk, TCP_FIN_WAIT2, tmo);
+						tcp_time_wait(sk, TCP_FIN_WAIT2, tmo); //本端发送的fin已经收到确认，等待对方发送fin
 						goto discard;
 					}
 				}
@@ -5942,6 +6461,11 @@ int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
 			break;
 
 		case TCP_CLOSING:
+		    /*
+			 * 如果通过ACK确认，所有的发送段(包括
+			 * FIN段)对方都已经收到，则从CLOSING状态
+			 * 迁移到TIME_WAIT状态，作2MSL超时等待
+			 */
 			if (tp->snd_una == tp->write_seq) {
 				tcp_time_wait(sk, TCP_TIME_WAIT, 0);
 				goto discard;
@@ -5949,6 +6473,12 @@ int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
 			break;
 
 		case TCP_LAST_ACK:
+		    /*
+			 * 如果通过ACK确认，所有的发送段(包括FIN段)
+			 * 对方都已经收到，则从LAST_ACK状态迁移到
+			 * CLOSE状态，把相关的metrics更新到目的路由项
+			 * 中，并关闭传输控制块。
+			 */
 			if (tp->snd_una == tp->write_seq) {
 				tcp_update_metrics(sk);
 				tcp_done(sk);
@@ -5960,15 +6490,29 @@ int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
 		goto discard;
 
 	/* step 6: check the URG bit */
+	/*
+	 * 处理带外数据
+	 */
 	tcp_urg(sk, skb, th);
 
 	/* step 7: process the segment text */
+	/*
+	 * 对于CLOSE_WAIT、CLOSING和LAST_ACK这三种状态，如果
+	 * 接收到已经确认过的段，则直接丢弃，否则与
+	 * FIN_WAIT1和FIN_WAIT2状态的处理方式一样。
+	 */
 	switch (sk->sk_state) {
 	case TCP_CLOSE_WAIT:
 	case TCP_CLOSING:
 	case TCP_LAST_ACK:
 		if (!before(TCP_SKB_CB(skb)->seq, tp->rcv_nxt))
 			break;
+
+    /*
+	 * 如果接收方向已关闭，而又接收到新的数据，
+	 * 则需给对端发送RST段，说明接收方已丢弃了
+	 * 该数据。
+	 */
 	case TCP_FIN_WAIT1:
 	case TCP_FIN_WAIT2:
 		/* RFC 793 says to queue data in these states,
@@ -5990,6 +6534,11 @@ int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
 		break;
 	}
 
+    /*
+	 * 如果TCP不处在CLOSE状态，则发送队列
+	 * 中的段，同时调度ACK，确定是否立即
+	 * 发送ACK还是延时发送。
+	 */
 	/* tcp_data could move socket to TIME-WAIT */
 	if (sk->sk_state != TCP_CLOSE) {
 		tcp_data_snd_check(sk);
@@ -6002,4 +6551,14 @@ discard:
 	}
 	return 0;
 }
+
+EXPORT_SYMBOL(sysctl_tcp_ecn);
+EXPORT_SYMBOL(sysctl_tcp_reordering);
+EXPORT_SYMBOL(sysctl_tcp_adv_win_scale);
+EXPORT_SYMBOL(tcp_parse_options);
+#ifdef CONFIG_TCP_MD5SIG
+EXPORT_SYMBOL(tcp_parse_md5sig_option);
+#endif
+EXPORT_SYMBOL(tcp_rcv_established);
 EXPORT_SYMBOL(tcp_rcv_state_process);
+EXPORT_SYMBOL(tcp_initialize_rcv_mss);

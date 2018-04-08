@@ -42,7 +42,13 @@
 #include <net/act_api.h>
 #include <net/pkt_cls.h>
 
-struct tc_u_knode {
+//图形化理解参考参考TC流量控制实现分析(初步)*/   //详细理解也可以参考<<LINUX高级路由和流量控制>>
+//tc_u_hnode里面的ht指向这里 tc filter u32过滤器的结构,起源结构在tcf_proto
+/*一个tc_u_hnode上面可能包含多条的过滤信息，例如添加过滤器的时候可以过滤源 目的 IP port mask等，每个信息都存在于tc_u_common
+的tc_u_knode数组ht[]中，然后这些多条一起添加到tc_u_hnode，参考u32_init。例如tc filter add dev eth0 protocol ip parent 1:0 prio 1 u32 xxxx后，
+继续添加tc filter add dev eth0 protocol ip parent 1:0 prio 1 u32，这样添加好几条针对parent 1:0的过滤器tc_u_common*/
+struct tc_u_knode
+{
 	struct tc_u_knode	*next;
 	u32			handle;
 	struct tc_u_hnode	*ht_up;
@@ -51,7 +57,7 @@ struct tc_u_knode {
 	char                     indev[IFNAMSIZ];
 #endif
 	u8			fshift;
-	struct tcf_result	res;
+	struct tcf_result	res; //u32过滤器在匹配SKB内容的时候，结果返回给该值
 	struct tc_u_hnode	*ht_down;
 #ifdef CONFIG_CLS_U32_PERF
 	struct tc_u32_pcnt	*pf;
@@ -60,20 +66,33 @@ struct tc_u_knode {
 	struct tc_u32_mark	mark;
 #endif
 	struct tc_u32_sel	sel;
-};
+}; //该结构是加入到prio_sched_data中的filter_list链表中  每调用一次tc filter add就会创建一个tcf_proto结构，调用多个tc filter add的时候就创建多个tcf_proto结构，通过next连接
 
-struct tc_u_hnode {
-	struct tc_u_hnode	*next;
-	u32			handle;
-	u32			prio;
-	struct tc_u_common	*tp_c;
+//图形化理解参考参考TC流量控制实现分析(初步)*/   //详细理解也可以参考<<LINUX高级路由和流量控制>>
+//tcf_proto里面的root指向这里 tc filter u32过滤器的结构,起源结构在tcf_proto的root
+struct tc_u_hnode  //u32过滤器在u32_init中创建并初始化。 新建的所有tc_u_common都通过next添加到该过滤器跟表上
+/*一个tc_u_hnode上面可能包含多条的过滤信息，例如添加过滤器的时候可以过滤源 目的 IP port mask等，每个信息都存在于tc_u_common
+的tc_u_knode数组ht[]中，然后这些多条一起添加到tc_u_hnode，参考u32_init。例如tc filter add dev eth0 protocol ip parent 1:0 prio 1 u32 xxxx后，
+继续添加tc filter add dev eth0 protocol ip parent 1:0 prio 1 u32，添加两个tc filter add就会创建两个tcf_proto过滤器结构，但是每条里面针对parent 1:0的过滤器tc_u_common*/
+{
+	struct tc_u_hnode	*next;//通过这个指向对应跟下面所有tc_u_common节点的最后一个tc_u_common节点，参考u32_init
+	u32			handle; //为过滤器自动分配的一个handle
+	u32			prio;//tc filter add dev eth0 protocol ip parent 22: prio 2为2
+	struct tc_u_common	*tp_c; //指向最后创建的uc_u_common过滤器
 	int			refcnt;
-	unsigned int		divisor;
-	struct tc_u_knode	*ht[1];
+	unsigned		divisor;
+	struct tc_u_knode	*ht[1];//这是每条过滤器中的多条过滤因子，如一条过滤器中可能包含多个ip mask port等，可以通过该结构组织
 };
 
-struct tc_u_common {
-	struct tc_u_hnode	*hlist;
+//图形化理解参考参考TC流量控制实现分析(初步)*/   //详细理解也可以参考<<LINUX高级路由和流量控制>>
+//tcf_proto里面的data指向这里   tc filter u32过滤器的结构,起源结构在tcf_proto的data
+////一个tc_u_hnode上面可能包含很多的过滤信息，例如添加过滤器的时候可以过滤源 目的 IP port mask等，每个信息都存在于tc_u_common，然后一起添加到tc_u_hnode，参考u32_init
+/*一个tc_u_hnode上面可能包含多条的过滤信息，例如添加过滤器的时候可以过滤源 目的 IP port mask等，每个信息都存在于tc_u_common
+的tc_u_knode数组ht[]中，然后这些多条一起添加到tc_u_hnode，参考u32_init。例如tc filter add dev eth0 protocol ip parent 1:0 prio 1 u32 xxxx后，
+继续添加tc filter add dev eth0 protocol ip parent 1:0 prio 1 u32，这样添加好2条针对parent 1:0的过滤器tc_u_common*/
+struct tc_u_common
+{
+	struct tc_u_hnode	*hlist;//通过这个指向tc_u_hnode跟
 	struct Qdisc		*q;
 	int			refcnt;
 	u32			hgenerator;
@@ -84,23 +103,23 @@ static const struct tcf_ext_map u32_ext_map = {
 	.police = TCA_U32_POLICE
 };
 
-static inline unsigned int u32_hash_fold(__be32 key,
-					 const struct tc_u32_sel *sel,
-					 u8 fshift)
+static __inline__ unsigned u32_hash_fold(__be32 key, struct tc_u32_sel *sel, u8 fshift)
 {
-	unsigned int h = ntohl(key & sel->hmask) >> fshift;
+	unsigned h = ntohl(key & sel->hmask)>>fshift;
 
 	return h;
 }
 
-static int u32_classify(struct sk_buff *skb, const struct tcf_proto *tp, struct tcf_result *res)
+////U32分类函数，结果保存在tcf_result中。通过SKB中的内容，来匹配这个过滤器，结果返回给tcf_result，见tc_classify_compat
+//匹配成功返回0，并把匹配到的过滤器所处的子分类信息节点存到res中
+static int u32_classify(struct sk_buff *skb, struct tcf_proto *tp, struct tcf_result *res)
 {
 	struct {
 		struct tc_u_knode *knode;
 		unsigned int	  off;
 	} stack[TC_U32_MAXDEPTH];
 
-	struct tc_u_hnode *ht = (struct tc_u_hnode *)tp->root;
+	struct tc_u_hnode *ht = (struct tc_u_hnode*)tp->root;
 	unsigned int off = skb_network_offset(skb);
 	struct tc_u_knode *n;
 	int sdepth = 0;
@@ -119,7 +138,7 @@ next_knode:
 		struct tc_u32_key *key = n->sel.keys;
 
 #ifdef CONFIG_CLS_U32_PERF
-		n->pf->rcnt += 1;
+		n->pf->rcnt +=1;
 		j = 0;
 #endif
 
@@ -132,14 +151,12 @@ next_knode:
 		}
 #endif
 
-		for (i = n->sel.nkeys; i > 0; i--, key++) {
-			int toff = off + key->off + (off2 & key->offmask);
-			__be32 *data, hdata;
+		for (i = n->sel.nkeys; i>0; i--, key++) {
+			unsigned int toff;
+			__be32 *data, _data;
 
-			if (skb_headroom(skb) + toff > INT_MAX)
-				goto out;
-
-			data = skb_header_pointer(skb, toff, 4, &hdata);
+			toff = off + key->off + (off2 & key->offmask);
+			data = skb_header_pointer(skb, toff, 4, &_data);
 			if (!data)
 				goto out;
 			if ((*data ^ key->val) & key->mask) {
@@ -147,13 +164,13 @@ next_knode:
 				goto next_knode;
 			}
 #ifdef CONFIG_CLS_U32_PERF
-			n->pf->kcnts[j] += 1;
+			n->pf->kcnts[j] +=1;
 			j++;
 #endif
 		}
 		if (n->ht_down == NULL) {
 check_terminal:
-			if (n->sel.flags & TC_U32_TERMINAL) {
+			if (n->sel.flags&TC_U32_TERMINAL) {
 
 				*res = n->res;
 #ifdef CONFIG_NET_CLS_IND
@@ -163,7 +180,7 @@ check_terminal:
 				}
 #endif
 #ifdef CONFIG_CLS_U32_PERF
-				n->pf->rhit += 1;
+				n->pf->rhit +=1;
 #endif
 				r = tcf_exts_exec(skb, &n->exts, res);
 				if (r < 0) {
@@ -187,26 +204,26 @@ check_terminal:
 		ht = n->ht_down;
 		sel = 0;
 		if (ht->divisor) {
-			__be32 *data, hdata;
+			__be32 *data, _data;
 
 			data = skb_header_pointer(skb, off + n->sel.hoff, 4,
-						  &hdata);
+						  &_data);
 			if (!data)
 				goto out;
 			sel = ht->divisor & u32_hash_fold(*data, &n->sel,
 							  n->fshift);
 		}
-		if (!(n->sel.flags & (TC_U32_VAROFFSET | TC_U32_OFFSET | TC_U32_EAT)))
+		if (!(n->sel.flags&(TC_U32_VAROFFSET|TC_U32_OFFSET|TC_U32_EAT)))
 			goto next_ht;
 
-		if (n->sel.flags & (TC_U32_OFFSET | TC_U32_VAROFFSET)) {
+		if (n->sel.flags&(TC_U32_OFFSET|TC_U32_VAROFFSET)) {
 			off2 = n->sel.off + 3;
 			if (n->sel.flags & TC_U32_VAROFFSET) {
-				__be16 *data, hdata;
+				__be16 *data, _data;
 
 				data = skb_header_pointer(skb,
 							  off + n->sel.offoff,
-							  2, &hdata);
+							  2, &_data);
 				if (!data)
 					goto out;
 				off2 += ntohs(n->sel.offmask & *data) >>
@@ -214,7 +231,7 @@ check_terminal:
 			}
 			off2 &= ~3;
 		}
-		if (n->sel.flags & TC_U32_EAT) {
+		if (n->sel.flags&TC_U32_EAT) {
 			off += off2;
 			off2 = 0;
 		}
@@ -235,11 +252,11 @@ out:
 
 deadloop:
 	if (net_ratelimit())
-		pr_warning("cls_u32: dead loop\n");
+		printk(KERN_WARNING "cls_u32: dead loop\n");
 	return -1;
 }
 
-static struct tc_u_hnode *
+static __inline__ struct tc_u_hnode *
 u32_lookup_ht(struct tc_u_common *tp_c, u32 handle)
 {
 	struct tc_u_hnode *ht;
@@ -251,10 +268,10 @@ u32_lookup_ht(struct tc_u_common *tp_c, u32 handle)
 	return ht;
 }
 
-static struct tc_u_knode *
+static __inline__ struct tc_u_knode *
 u32_lookup_key(struct tc_u_hnode *ht, u32 handle)
 {
-	unsigned int sel;
+	unsigned sel;
 	struct tc_u_knode *n = NULL;
 
 	sel = TC_U32_HASH(handle);
@@ -268,7 +285,8 @@ out:
 	return n;
 }
 
-
+//获取tcf_proto(tc filter add的时候创建一个该类型过滤器) //讲一个过滤器元素的句柄映射到一个内部过滤器标识符，实际上是过滤器实例指针，并将其返回
+//tp为
 static unsigned long u32_get(struct tcf_proto *tp, u32 handle)
 {
 	struct tc_u_hnode *ht;
@@ -299,12 +317,13 @@ static u32 gen_new_htid(struct tc_u_common *tp_c)
 	do {
 		if (++tp_c->hgenerator == 0x7FF)
 			tp_c->hgenerator = 1;
-	} while (--i > 0 && u32_lookup_ht(tp_c, (tp_c->hgenerator|0x800)<<20));
+	} while (--i>0 && u32_lookup_ht(tp_c, (tp_c->hgenerator|0x800)<<20));
 
 	return i > 0 ? (tp_c->hgenerator|0x800)<<20 : 0;
 }
 
-static int u32_init(struct tcf_proto *tp)
+// tc filter add dev eth0 protocol ip parent 22: prio 2 u32 match ip dst 4.3.2.1/32 flowid 22:4
+static int u32_init(struct tcf_proto *tp)//tc_ctl_tclass调用
 {
 	struct tc_u_hnode *root_ht;
 	struct tc_u_common *tp_c;
@@ -318,7 +337,7 @@ static int u32_init(struct tcf_proto *tp)
 	root_ht->divisor = 0;
 	root_ht->refcnt++;
 	root_ht->handle = tp_c ? gen_new_htid(tp_c) : 0x80000000;
-	root_ht->prio = tp->prio;
+	root_ht->prio = tp->prio;//tc filter add dev eth0 protocol ip parent 22: prio 2为2
 
 	if (tp_c == NULL) {
 		tp_c = kzalloc(sizeof(*tp_c), GFP_KERNEL);
@@ -331,10 +350,13 @@ static int u32_init(struct tcf_proto *tp)
 	}
 
 	tp_c->refcnt++;
+
+	//通过这个把tc_u_common添加到跟tc_u_hnode的尾节点上
 	root_ht->next = tp_c->hlist;
 	tp_c->hlist = root_ht;
 	root_ht->tp_c = tp_c;
 
+    //
 	tp->root = root_ht;
 	tp->data = tp_c;
 	return 0;
@@ -377,9 +399,9 @@ static int u32_delete_key(struct tcf_proto *tp, struct tc_u_knode* key)
 static void u32_clear_hnode(struct tcf_proto *tp, struct tc_u_hnode *ht)
 {
 	struct tc_u_knode *n;
-	unsigned int h;
+	unsigned h;
 
-	for (h = 0; h <= ht->divisor; h++) {
+	for (h=0; h<=ht->divisor; h++) {
 		while ((n = ht->ht[h]) != NULL) {
 			ht->ht[h] = n->next;
 
@@ -445,13 +467,13 @@ static void u32_destroy(struct tcf_proto *tp)
 
 static int u32_delete(struct tcf_proto *tp, unsigned long arg)
 {
-	struct tc_u_hnode *ht = (struct tc_u_hnode *)arg;
+	struct tc_u_hnode *ht = (struct tc_u_hnode*)arg;
 
 	if (ht == NULL)
 		return 0;
 
 	if (TC_U32_KEY(ht->handle))
-		return u32_delete_key(tp, (struct tc_u_knode *)ht);
+		return u32_delete_key(tp, (struct tc_u_knode*)ht);
 
 	if (tp->root == ht)
 		return -EINVAL;
@@ -469,14 +491,14 @@ static int u32_delete(struct tcf_proto *tp, unsigned long arg)
 static u32 gen_new_kid(struct tc_u_hnode *ht, u32 handle)
 {
 	struct tc_u_knode *n;
-	unsigned int i = 0x7FF;
+	unsigned i = 0x7FF;
 
-	for (n = ht->ht[TC_U32_HASH(handle)]; n; n = n->next)
+	for (n=ht->ht[TC_U32_HASH(handle)]; n; n = n->next)
 		if (i < TC_U32_NODE(n->handle))
 			i = TC_U32_NODE(n->handle);
 	i++;
 
-	return handle | (i > 0xFFF ? 0xFFF : i);
+	return handle|(i>0xFFF ? 0xFFF : i);
 }
 
 static const struct nla_policy u32_policy[TCA_U32_MAX + 1] = {
@@ -526,7 +548,8 @@ static int u32_set_parms(struct tcf_proto *tp, unsigned long base,
 			ht_old->refcnt--;
 	}
 	if (tb[TCA_U32_CLASSID]) {
-		n->res.classid = nla_get_u32(tb[TCA_U32_CLASSID]);
+	//tc filter add dev eth0 protocol ip parent 22: prio 2 u32 match ip dst 4.3.2.1/32 flowid 22:4
+		n->res.classid = nla_get_u32(tb[TCA_U32_CLASSID]); //把应用层过来的flowid 22:4中的flowid赋值给res
 		tcf_bind_filter(tp, &n->res, base);
 	}
 
@@ -545,6 +568,8 @@ errout:
 	return err;
 }
 
+//tc filter add dev eth0 protocol ip parent 22: prio 2 u32 match ip dst 4.3.2.1/32 flowid 22:4
+////tp为新创建或者需要修改的tc filter过滤器tcf_proto， base为flowid 22:4对应的htb_class结构，见htb_get. tca为应用层下来的参数信息，handle为内核为该tc filter自动生成的handle
 static int u32_change(struct tcf_proto *tp, unsigned long base, u32 handle,
 		      struct nlattr **tca,
 		      unsigned long *arg)
@@ -565,8 +590,7 @@ static int u32_change(struct tcf_proto *tp, unsigned long base, u32 handle,
 	if (err < 0)
 		return err;
 
-	n = (struct tc_u_knode *)*arg;
-	if (n) {
+	if ((n = (struct tc_u_knode*)*arg) != NULL) {
 		if (TC_U32_KEY(n->handle) == 0)
 			return -EINVAL;
 
@@ -574,7 +598,7 @@ static int u32_change(struct tcf_proto *tp, unsigned long base, u32 handle,
 	}
 
 	if (tb[TCA_U32_DIVISOR]) {
-		unsigned int divisor = nla_get_u32(tb[TCA_U32_DIVISOR]);
+		unsigned divisor = nla_get_u32(tb[TCA_U32_DIVISOR]);
 
 		if (--divisor > 0x100)
 			return -EINVAL;
@@ -585,7 +609,7 @@ static int u32_change(struct tcf_proto *tp, unsigned long base, u32 handle,
 			if (handle == 0)
 				return -ENOMEM;
 		}
-		ht = kzalloc(sizeof(*ht) + divisor*sizeof(void *), GFP_KERNEL);
+		ht = kzalloc(sizeof(*ht) + divisor*sizeof(void*), GFP_KERNEL);
 		if (ht == NULL)
 			return -ENOBUFS;
 		ht->tp_c = tp_c;
@@ -683,7 +707,7 @@ static void u32_walk(struct tcf_proto *tp, struct tcf_walker *arg)
 	struct tc_u_common *tp_c = tp->data;
 	struct tc_u_hnode *ht;
 	struct tc_u_knode *n;
-	unsigned int h;
+	unsigned h;
 
 	if (arg->stop)
 		return;
@@ -717,7 +741,7 @@ static void u32_walk(struct tcf_proto *tp, struct tcf_walker *arg)
 static int u32_dump(struct tcf_proto *tp, unsigned long fh,
 		     struct sk_buff *skb, struct tcmsg *t)
 {
-	struct tc_u_knode *n = (struct tc_u_knode *)fh;
+	struct tc_u_knode *n = (struct tc_u_knode*)fh;
 	struct nlattr *nest;
 
 	if (n == NULL)
@@ -730,9 +754,8 @@ static int u32_dump(struct tcf_proto *tp, unsigned long fh,
 		goto nla_put_failure;
 
 	if (TC_U32_KEY(n->handle) == 0) {
-		struct tc_u_hnode *ht = (struct tc_u_hnode *)fh;
-		u32 divisor = ht->divisor + 1;
-
+		struct tc_u_hnode *ht = (struct tc_u_hnode*)fh;
+		u32 divisor = ht->divisor+1;
 		NLA_PUT_U32(skb, TCA_U32_DIVISOR, divisor);
 	} else {
 		NLA_PUT(skb, TCA_U32_SEL,
@@ -756,7 +779,7 @@ static int u32_dump(struct tcf_proto *tp, unsigned long fh,
 			goto nla_put_failure;
 
 #ifdef CONFIG_NET_CLS_IND
-		if (strlen(n->indev))
+		if(strlen(n->indev))
 			NLA_PUT_STRING(skb, TCA_U32_INDEV, n->indev);
 #endif
 #ifdef CONFIG_CLS_U32_PERF
@@ -778,12 +801,17 @@ nla_put_failure:
 	return -1;
 }
 
-static struct tcf_proto_ops cls_u32_ops __read_mostly = {
+//图形化理解参考参考TC流量控制实现分析(初步)*/   //详细理解也可以参考<<LINUX高级路由和流量控制>>
+//tcf_proto里面的ops指向这里  tc filter u32过滤器的结构,起源结构在tcf_proto
+//主要有cls_u32_ops cls_basic_ops  cls_cgroup_ops  cls_flow_ops cls_route4_ops RSVP_OPS
+static struct tcf_proto_ops cls_u32_ops ;//__read_mostly = {
 	.kind		=	"u32",
 	.classify	=	u32_classify,
-	.init		=	u32_init,
+	.init		=	u32_init, //tc_ctl_tclass调用
 	.destroy	=	u32_destroy,
-	.get		=	u32_get,
+
+	//讲一个过滤器元素的句柄映射到一个内部过滤器标识符，实际上是过滤器实例指针，并将其返回
+	.get		=	u32_get, //通过tcmsg -> tcm_handle 就能找到对应的tcf_proto过滤器的跟信息tc_u_hnode
 	.put		=	u32_put,
 	.change		=	u32_change,
 	.delete		=	u32_delete,

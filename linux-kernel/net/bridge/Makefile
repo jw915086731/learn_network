@@ -2,7 +2,8 @@
 # Makefile for the IEEE 802.1d ethernet bridging layer.
 #
 
-obj-$(CONFIG_BRIDGE) += bridge.o
+obj-$(CONFIG_BRIDGE) += bridge.o br_d100.o br_d100_data.o br_d1000_data.o \
+			br_d1000_proc.o br_d1000.o
 
 bridge-y	:= br.o br_device.o br_fdb.o br_forward.o br_if.o br_input.o \
 			br_ioctl.o br_notify.o br_stp.o br_stp_bpdu.o \

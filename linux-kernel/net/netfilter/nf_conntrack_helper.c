@@ -7,6 +7,9 @@
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
  * published by the Free Software Foundation.
+ 处理一个连接的子连接协议，利用nf_conntrack_helper.c文件中的nf_conntrack_helper_register(struct nf_conntrack_helper *me)来注册nf_conntrack_helper结构
+参考:http://blog.csdn.net/ye_shizhe/article/details/17331947
+连接跟踪为每个应用成的协议通过一个helper结构，同过这个结构的成员函数应用层的协议可以做一些与自己协议相关的工作
  */
 
 #include <linux/types.h>
@@ -29,10 +32,22 @@
 #include <net/netfilter/nf_conntrack_core.h>
 #include <net/netfilter/nf_conntrack_extend.h>
 
+
+/*
+参考:http://blog.csdn.net/ye_shizhe/article/details/17331947
+连接跟踪为每个应用成的协议通过一个helper结构，同过这个结构的成员函数应用层的协议可以做一些与自己协议相关的工作
+*/
 static DEFINE_MUTEX(nf_ct_helper_mutex);
-static struct hlist_head *nf_ct_helper_hash __read_mostly;
-static unsigned int nf_ct_helper_hsize __read_mostly;
-static unsigned int nf_ct_helper_count __read_mostly;
+//static struct hlist_head *nf_ct_helper_hash __read_mostly;//
+//static unsigned int nf_ct_helper_hsize __read_mostly;
+//static unsigned int nf_ct_helper_count __read_mostly;
+
+//参考:http://blog.csdn.net/ye_shizhe/article/details/17331947
+static struct hlist_head *nf_ct_helper_hash;// 节点为struct nf_conntrack_helper   见nf_conntrack_helper_register
+static unsigned int nf_ct_helper_hsize;//nf_ct_helper_hash[nf_ct_helper_hsize]
+static unsigned int nf_ct_helper_count;
+
+static int nf_ct_helper_vmalloc;
 
 
 /* Stupid hash, but collision free for the default registrations of the
@@ -131,7 +146,7 @@ int __nf_ct_try_assign_helper(struct nf_conn *ct, struct nf_conn *tmpl,
 		helper = __nf_ct_helper_find(&ct->tuplehash[IP_CT_DIR_REPLY].tuple);
 	if (helper == NULL) {
 		if (help)
-			RCU_INIT_POINTER(help->helper, NULL);
+			rcu_assign_pointer(help->helper, NULL);
 		goto out;
 	}
 
@@ -145,7 +160,7 @@ int __nf_ct_try_assign_helper(struct nf_conn *ct, struct nf_conn *tmpl,
 		memset(&help->help, 0, sizeof(help->help));
 	}
 
-	RCU_INIT_POINTER(help->helper, helper);
+	rcu_assign_pointer(help->helper, helper);
 out:
 	return ret;
 }
@@ -157,16 +172,14 @@ static inline int unhelp(struct nf_conntrack_tuple_hash *i,
 	struct nf_conn *ct = nf_ct_tuplehash_to_ctrack(i);
 	struct nf_conn_help *help = nfct_help(ct);
 
-	if (help && rcu_dereference_protected(
-			help->helper,
-			lockdep_is_held(&nf_conntrack_lock)
-			) == me) {
+	if (help && help->helper == me) {
 		nf_conntrack_event(IPCT_HELPER, ct);
-		RCU_INIT_POINTER(help->helper, NULL);
+		rcu_assign_pointer(help->helper, NULL);
 	}
 	return 0;
 }
 
+//释放help相关资源
 void nf_ct_helper_destroy(struct nf_conn *ct)
 {
 	struct nf_conn_help *help = nfct_help(ct);
@@ -212,10 +225,7 @@ static void __nf_conntrack_helper_unregister(struct nf_conntrack_helper *me,
 		hlist_for_each_entry_safe(exp, n, next,
 					  &net->ct.expect_hash[i], hnode) {
 			struct nf_conn_help *help = nfct_help(exp->master);
-			if ((rcu_dereference_protected(
-					help->helper,
-					lockdep_is_held(&nf_conntrack_lock)
-					) == me || exp->helper == me) &&
+			if ((help->helper == me || exp->helper == me) &&
 			    del_timer(&exp->timeout)) {
 				nf_ct_unlink_expect(exp);
 				nf_ct_expect_put(exp);
@@ -255,7 +265,8 @@ void nf_conntrack_helper_unregister(struct nf_conntrack_helper *me)
 }
 EXPORT_SYMBOL_GPL(nf_conntrack_helper_unregister);
 
-static struct nf_ct_ext_type helper_extend __read_mostly = {
+//static struct nf_ct_ext_type helper_extend __read_mostly = {
+static struct nf_ct_ext_type helper_extend = {
 	.len	= sizeof(struct nf_conn_help),
 	.align	= __alignof__(struct nf_conn_help),
 	.id	= NF_CT_EXT_HELPER,
@@ -266,7 +277,8 @@ int nf_conntrack_helper_init(void)
 	int err;
 
 	nf_ct_helper_hsize = 1; /* gets rounded up to use one page */
-	nf_ct_helper_hash = nf_ct_alloc_hashtable(&nf_ct_helper_hsize, 0);
+	nf_ct_helper_hash = nf_ct_alloc_hashtable(&nf_ct_helper_hsize,
+						  &nf_ct_helper_vmalloc, 0);
 	if (!nf_ct_helper_hash)
 		return -ENOMEM;
 
@@ -277,12 +289,14 @@ int nf_conntrack_helper_init(void)
 	return 0;
 
 err1:
-	nf_ct_free_hashtable(nf_ct_helper_hash, nf_ct_helper_hsize);
+	nf_ct_free_hashtable(nf_ct_helper_hash, nf_ct_helper_vmalloc,
+			     nf_ct_helper_hsize);
 	return err;
 }
 
 void nf_conntrack_helper_fini(void)
 {
 	nf_ct_extend_unregister(&helper_extend);
-	nf_ct_free_hashtable(nf_ct_helper_hash, nf_ct_helper_hsize);
+	nf_ct_free_hashtable(nf_ct_helper_hash, nf_ct_helper_vmalloc,
+			     nf_ct_helper_hsize);
 }

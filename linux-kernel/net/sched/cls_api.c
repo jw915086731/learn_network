@@ -32,17 +32,19 @@
 #include <net/pkt_cls.h>
 
 /* The list of all installed classifier types */
-
-static struct tcf_proto_ops *tcf_proto_base __read_mostly;
+//tcf_proto中的ops，所有的tcf_proto_ops通过tcf_proto_base连接在一起，见register_tcf_proto_ops
+//主要有cls_u32_ops cls_basic_ops  cls_cgroup_ops  cls_flow_ops cls_route4_ops RSVP_OPS
+static struct tcf_proto_ops *tcf_proto_base;// __read_mostly;
 
 /* Protects list of registered TC modules. It is pure SMP lock. */
 static DEFINE_RWLOCK(cls_mod_lock);
 
 /* Find classifier type by string name */
 
-static const struct tcf_proto_ops *tcf_proto_lookup_ops(struct nlattr *kind)
+//通过tc filter add dev eth0 protocol ip parent 22: prio 2 u32 match ip dst 4.3.2.1/32 flowid 22:4中的u32查找对应的tcf_proto_ops
+static struct tcf_proto_ops *tcf_proto_lookup_ops(struct nlattr *kind)
 {
-	const struct tcf_proto_ops *t = NULL;
+	struct tcf_proto_ops *t = NULL;
 
 	if (kind) {
 		read_lock(&cls_mod_lock);
@@ -59,8 +61,10 @@ static const struct tcf_proto_ops *tcf_proto_lookup_ops(struct nlattr *kind)
 }
 
 /* Register(unregister) new classifier type */
-
-int register_tcf_proto_ops(struct tcf_proto_ops *ops)
+//    使用int register_qdisc(struct Qdisc_ops *qops)注册对象类型。
+//    使用int register_tcf_proto_ops(struct tcf_proto_ops *ops)注册过滤器类型。
+//把OPS添加到tcf_proto_base链表中
+int register_tcf_proto_ops(struct tcf_proto_ops *ops) //主要有cls_u32_ops cls_basic_ops  cls_cgroup_ops  cls_flow_ops cls_route4_ops RSVP_OPS
 {
 	struct tcf_proto_ops *t, **tp;
 	int rc = -EEXIST;
@@ -85,7 +89,7 @@ int unregister_tcf_proto_ops(struct tcf_proto_ops *ops)
 	int rc = -ENOENT;
 
 	write_lock(&cls_mod_lock);
-	for (tp = &tcf_proto_base; (t = *tp) != NULL; tp = &t->next)
+	for (tp = &tcf_proto_base; (t=*tp) != NULL; tp = &t->next)
 		if (t == ops)
 			break;
 
@@ -111,13 +115,15 @@ static inline u32 tcf_auto_prio(struct tcf_proto *tp)
 	u32 first = TC_H_MAKE(0xC0000000U, 0U);
 
 	if (tp)
-		first = tp->prio - 1;
+		first = tp->prio-1;
 
 	return first;
 }
 
 /* Add/change/delete/get a filter node */
-
+//tc class 和tc qdisc在pktsched_init注册
+//tc filter add dev eth0 protocol ip parent 22: prio 2 u32 match ip dst 4.3.2.1/32 flowid 22:4
+//过滤器ops主要有//主要有cls_u32_ops cls_basic_ops  cls_cgroup_ops  cls_flow_ops cls_route4_ops RSVP_OPS
 static int tc_ctl_tfilter(struct sk_buff *skb, struct nlmsghdr *n, void *arg)
 {
 	struct net *net = sock_net(skb->sk);
@@ -127,30 +133,30 @@ static int tc_ctl_tfilter(struct sk_buff *skb, struct nlmsghdr *n, void *arg)
 	u32 protocol;
 	u32 prio;
 	u32 nprio;
-	u32 parent;
+	u32 parent;//父handle 如22:0 表示过滤器所处的分类节点class或者所处qdisc
 	struct net_device *dev;
 	struct Qdisc  *q;
-	struct tcf_proto **back, **chain;
+	struct tcf_proto **back, 
+	    **chain;//存储filter的链表
 	struct tcf_proto *tp;
-	const struct tcf_proto_ops *tp_ops;
+	struct tcf_proto_ops *tp_ops;
 	const struct Qdisc_class_ops *cops;
-	unsigned long cl;
+	unsigned long cl; //实际上就是classid 3:4对应的htb_class结构地址， 见htb_get
 	unsigned long fh;
 	int err;
 	int tp_created = 0;
 
 replay:
 	t = NLMSG_DATA(n);
-	protocol = TC_H_MIN(t->tcm_info);
-	prio = TC_H_MAJ(t->tcm_info);
+	protocol = TC_H_MIN(t->tcm_info); //protocol ip对应的是数字ETH_P_IP
+	prio = TC_H_MAJ(t->tcm_info); //对应prio
 	nprio = prio;
 	parent = t->tcm_parent;
 	cl = 0;
 
-	if (prio == 0) {
+	if (prio == 0) { //如果应用层指定的prio为0，或者未指定prio，则默认指定一个0x80的优先级
 		/* If no priority is given, user wants we allocated it. */
-		if (n->nlmsg_type != RTM_NEWTFILTER ||
-		    !(n->nlmsg_flags & NLM_F_CREATE))
+		if (n->nlmsg_type != RTM_NEWTFILTER || !(n->nlmsg_flags&NLM_F_CREATE))
 			return -ENOENT;
 		prio = TC_H_MAKE(0x80000000U, 0U);
 	}
@@ -167,7 +173,7 @@ replay:
 		return err;
 
 	/* Find qdisc */
-	if (!parent) {
+	if (!parent) { //说明是跟队列规程
 		q = dev->qdisc;
 		parent = q->handle;
 	} else {
@@ -177,32 +183,31 @@ replay:
 	}
 
 	/* Is it classful? */
-	cops = q->ops->cl_ops;
-	if (!cops)
+	if ((cops = q->ops->cl_ops) == NULL)
 		return -EINVAL;
 
 	if (cops->tcf_chain == NULL)
 		return -EOPNOTSUPP;
 
 	/* Do we search for filter, attached to class? */
-	if (TC_H_MIN(parent)) {
-		cl = cops->get(q, parent);
+	if (TC_H_MIN(parent)) {//parent 22:4 该filter是选择父qdisc的分类数组中的那个具体分类信息
+		cl = cops->get(q, parent);//见htb_get,也就是该过滤器是放到那个地方，就是parent接点上面加个过滤器
 		if (cl == 0)
 			return -ENOENT;
 	}
 
 	/* And the last stroke */
-	chain = cops->tcf_chain(q, cl);
+	chain = cops->tcf_chain(q, cl); //如果为prio 返回prio_sched_data->filter_list，过滤器所在class或者qdisc处的过滤器链表
 	err = -EINVAL;
 	if (chain == NULL)
 		goto errout;
 
 	/* Check the chain for existence of proto-tcf with this priority */
-	for (back = chain; (tp = *back) != NULL; back = &tp->next) {
+	//检查是否存在该优先级的filter
+	for (back = chain; (tp=*back) != NULL; back = &tp->next) {
 		if (tp->prio >= prio) {
 			if (tp->prio == prio) {
-				if (!nprio ||
-				    (tp->protocol != protocol && protocol))
+				if (!nprio || (tp->protocol != protocol && protocol))
 					goto errout;
 			} else
 				tp = NULL;
@@ -219,19 +224,18 @@ replay:
 			goto errout;
 
 		err = -ENOENT;
-		if (n->nlmsg_type != RTM_NEWTFILTER ||
-		    !(n->nlmsg_flags & NLM_F_CREATE))
+		if (n->nlmsg_type != RTM_NEWTFILTER || !(n->nlmsg_flags&NLM_F_CREATE))
 			goto errout;
 
 
 		/* Create new proto tcf */
 
 		err = -ENOBUFS;
-		tp = kzalloc(sizeof(*tp), GFP_KERNEL);
+		tp = kzalloc(sizeof(*tp), GFP_KERNEL); //开辟filter过滤器空间
 		if (tp == NULL)
 			goto errout;
 		err = -ENOENT;
-		tp_ops = tcf_proto_lookup_ops(tca[TCA_KIND]);
+		tp_ops = tcf_proto_lookup_ops(tca[TCA_KIND]); ////主要有cls_u32_ops cls_basic_ops  cls_cgroup_ops  cls_flow_ops cls_route4_ops RSVP_OPS
 		if (tp_ops == NULL) {
 #ifdef CONFIG_MODULES
 			struct nlattr *kind = tca[TCA_KIND];
@@ -260,12 +264,12 @@ replay:
 		}
 		tp->ops = tp_ops;
 		tp->protocol = protocol;
-		tp->prio = nprio ? : TC_H_MAJ(tcf_auto_prio(*back));
+		tp->prio = nprio ? : TC_H_MAJ(tcf_auto_prio(*back)); //自动分配一个优先级
 		tp->q = q;
 		tp->classify = tp_ops->classify;
 		tp->classid = parent;
 
-		err = tp_ops->init(tp);
+		err = tp_ops->init(tp);////主要有cls_u32_ops cls_basic_ops  cls_cgroup_ops  cls_flow_ops cls_route4_ops RSVP_OPS
 		if (err != 0) {
 			module_put(tp_ops->owner);
 			kfree(tp);
@@ -277,7 +281,8 @@ replay:
 	} else if (tca[TCA_KIND] && nla_strcmp(tca[TCA_KIND], tp->ops->kind))
 		goto errout;
 
-	fh = tp->ops->get(tp, t->tcm_handle);
+    //tc filter add dev eth0 protocol ip parent 22: prio 2 u32 match ip dst 4.3.2.1/32 flowid 22:4
+	fh = tp->ops->get(tp, t->tcm_handle); //主要有cls_u32_ops cls_basic_ops  cls_cgroup_ops  cls_flow_ops cls_route4_ops RSVP_OPS
 
 	if (fh == 0) {
 		if (n->nlmsg_type == RTM_DELTFILTER && t->tcm_handle == 0) {
@@ -319,11 +324,11 @@ replay:
 		}
 	}
 
-	err = tp->ops->change(tp, cl, t->tcm_handle, tca, &fh);
+	err = tp->ops->change(tp, cl, t->tcm_handle, tca, &fh); //tp为新创建或者需要修改的tc filter过滤器tcf_proto， cl为classid 3:4对应的htb_class结构，见htb_get
 	if (err == 0) {
 		if (tp_created) {
 			spin_lock_bh(root_lock);
-			tp->next = *back;
+			tp->next = *back; //把新创建的tcf_proto天骄到chain = cops->tcf_chain(q, cl);过滤器链表尾部
 			*back = tp;
 			spin_unlock_bh(root_lock);
 		}
@@ -424,8 +429,7 @@ static int tc_dump_tfilter(struct sk_buff *skb, struct netlink_callback *cb)
 
 	if (cb->nlh->nlmsg_len < NLMSG_LENGTH(sizeof(*tcm)))
 		return skb->len;
-	dev = __dev_get_by_index(net, tcm->tcm_ifindex);
-	if (!dev)
+	if ((dev = __dev_get_by_index(net, tcm->tcm_ifindex)) == NULL)
 		return skb->len;
 
 	if (!tcm->tcm_parent)
@@ -434,8 +438,7 @@ static int tc_dump_tfilter(struct sk_buff *skb, struct netlink_callback *cb)
 		q = qdisc_lookup(dev, TC_H_MAJ(tcm->tcm_parent));
 	if (!q)
 		goto out;
-	cops = q->ops->cl_ops;
-	if (!cops)
+	if ((cops = q->ops->cl_ops) == NULL)
 		goto errout;
 	if (cops->tcf_chain == NULL)
 		goto errout;
@@ -450,9 +453,8 @@ static int tc_dump_tfilter(struct sk_buff *skb, struct netlink_callback *cb)
 
 	s_t = cb->args[0];
 
-	for (tp = *chain, t = 0; tp; tp = tp->next, t++) {
-		if (t < s_t)
-			continue;
+	for (tp=*chain, t=0; tp; tp = tp->next, t++) {
+		if (t < s_t) continue;
 		if (TC_H_MAJ(tcm->tcm_info) &&
 		    TC_H_MAJ(tcm->tcm_info) != tp->prio)
 			continue;
@@ -475,10 +477,10 @@ static int tc_dump_tfilter(struct sk_buff *skb, struct netlink_callback *cb)
 		arg.skb = skb;
 		arg.cb = cb;
 		arg.w.stop = 0;
-		arg.w.skip = cb->args[1] - 1;
+		arg.w.skip = cb->args[1]-1;
 		arg.w.count = 0;
 		tp->ops->walk(tp, &arg.w);
-		cb->args[1] = arg.w.count + 1;
+		cb->args[1] = arg.w.count+1;
 		if (arg.w.stop)
 			break;
 	}
@@ -608,12 +610,13 @@ nla_put_failure: __attribute__ ((unused))
 }
 EXPORT_SYMBOL(tcf_exts_dump_stats);
 
+//tc class 和tc qdisc在pktsched_init注册
 static int __init tc_filter_init(void)
 {
-	rtnl_register(PF_UNSPEC, RTM_NEWTFILTER, tc_ctl_tfilter, NULL, NULL);
-	rtnl_register(PF_UNSPEC, RTM_DELTFILTER, tc_ctl_tfilter, NULL, NULL);
+	rtnl_register(PF_UNSPEC, RTM_NEWTFILTER, tc_ctl_tfilter, NULL);
+	rtnl_register(PF_UNSPEC, RTM_DELTFILTER, tc_ctl_tfilter, NULL);
 	rtnl_register(PF_UNSPEC, RTM_GETTFILTER, tc_ctl_tfilter,
-		      tc_dump_tfilter, NULL);
+						 tc_dump_tfilter);
 
 	return 0;
 }

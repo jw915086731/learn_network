@@ -8,16 +8,13 @@
 #include <linux/idr.h>
 #include <linux/rculist.h>
 #include <linux/nsproxy.h>
-#include <linux/proc_fs.h>
-#include <linux/file.h>
-#include <linux/export.h>
 #include <net/net_namespace.h>
 #include <net/netns/generic.h>
 
 /*
  *	Our network namespace constructor/destructor lists
  */
-
+extern struct list_head pernet_list;//自己加的，为了source insight好用
 static LIST_HEAD(pernet_list);
 static struct list_head *first_device = &pernet_list;
 static DEFINE_MUTEX(net_mutex);
@@ -25,10 +22,22 @@ static DEFINE_MUTEX(net_mutex);
 LIST_HEAD(net_namespace_list);
 EXPORT_SYMBOL_GPL(net_namespace_list);
 
-struct net init_net;
+/*
+init_net.ct结构体中的值可以通过nf_ct_sysctl_table注册
+struct net是一个网络名字空间namespace，在不同的名字空间里面可以有自己的转发信息库，有自己的一套net_device等等。默认情况下都是使用 init_net这个全局变量
+*/
+struct net init_net; //命名空间
 EXPORT_SYMBOL(init_net);
 
 #define INITIAL_NET_GEN_PTRS	13 /* +1 for len +2 for rcu_head */
+
+static void net_generic_release(struct rcu_head *rcu)
+{
+	struct net_generic *ng;
+
+	ng = container_of(rcu, struct net_generic, rcu);
+	kfree(ng);
+}
 
 static int net_assign_generic(struct net *net, int id, void *data)
 {
@@ -37,9 +46,7 @@ static int net_assign_generic(struct net *net, int id, void *data)
 	BUG_ON(!mutex_is_locked(&net_mutex));
 	BUG_ON(id == 0);
 
-	old_ng = rcu_dereference_protected(net->gen,
-					   lockdep_is_held(&net_mutex));
-	ng = old_ng;
+	ng = old_ng = net->gen;
 	if (old_ng->len >= id)
 		goto assign;
 
@@ -63,7 +70,7 @@ static int net_assign_generic(struct net *net, int id, void *data)
 	memcpy(&ng->ptr, &old_ng->ptr, old_ng->len * sizeof(void*));
 
 	rcu_assign_pointer(net->gen, ng);
-	kfree_rcu(old_ng, rcu);
+	call_rcu(&old_ng->rcu, net_generic_release);
 assign:
 	ng->ptr[id - 1] = data;
 	return 0;
@@ -129,8 +136,6 @@ static __net_init int setup_net(struct net *net)
 	LIST_HEAD(net_exit_list);
 
 	atomic_set(&net->count, 1);
-	atomic_set(&net->passive, 1);
-	net->dev_base_seq = 1;
 
 #ifdef NETNS_REFCNT_DEBUG
 	atomic_set(&net->use_count, 0);
@@ -213,20 +218,10 @@ static void net_free(struct net *net)
 	kmem_cache_free(net_cachep, net);
 }
 
-void net_drop_ns(void *p)
-{
-	struct net *ns = p;
-	if (ns && atomic_dec_and_test(&ns->passive))
-		net_free(ns);
-}
-
-struct net *copy_net_ns(unsigned long flags, struct net *old_net)
+static struct net *net_create(void)
 {
 	struct net *net;
 	int rv;
-
-	if (!(flags & CLONE_NEWNET))
-		return get_net(old_net);
 
 	net = net_alloc();
 	if (!net)
@@ -240,14 +235,23 @@ struct net *copy_net_ns(unsigned long flags, struct net *old_net)
 	}
 	mutex_unlock(&net_mutex);
 	if (rv < 0) {
-		net_drop_ns(net);
+		net_free(net);
 		return ERR_PTR(rv);
 	}
 	return net;
 }
 
+//定义了CONFIG_NET_NS的时候用这个
+struct net *copy_net_ns(unsigned long flags, struct net *old_net)
+{
+	if (!(flags & CLONE_NEWNET))
+		return get_net(old_net);
+	return net_create();
+}
+
 static DEFINE_SPINLOCK(cleanup_list_lock);
-static LIST_HEAD(cleanup_list);  /* Must hold cleanup_list_lock to touch */
+//static LIST_HEAD(cleanup_list);  /* Must hold cleanup_list_lock to touch */
+static struct list cleanup_list;  /* Must hold cleanup_list_lock to touch */
 
 static void cleanup_net(struct work_struct *work)
 {
@@ -296,11 +300,12 @@ static void cleanup_net(struct work_struct *work)
 	/* Finally it is safe to free my network namespace structure */
 	list_for_each_entry_safe(net, tmp, &net_exit_list, exit_list) {
 		list_del_init(&net->exit_list);
-		net_drop_ns(net);
+		net_free(net);
 	}
 }
 static DECLARE_WORK(net_cleanup_work, cleanup_net);
 
+//把net添加到cleanup_list
 void __put_net(struct net *net)
 {
 	/* Cleanup the network namespace in process context */
@@ -314,37 +319,13 @@ void __put_net(struct net *net)
 }
 EXPORT_SYMBOL_GPL(__put_net);
 
-struct net *get_net_ns_by_fd(int fd)
-{
-	struct proc_inode *ei;
-	struct file *file;
-	struct net *net;
-
-	file = proc_ns_fget(fd);
-	if (IS_ERR(file))
-		return ERR_CAST(file);
-
-	ei = PROC_I(file->f_dentry->d_inode);
-	if (ei->ns_ops == &netns_operations)
-		net = get_net(ei->ns);
-	else
-		net = ERR_PTR(-EINVAL);
-
-	fput(file);
-	return net;
-}
-
 #else
+//没有定义CONFIG_NET_NS的时候用这个
 struct net *copy_net_ns(unsigned long flags, struct net *old_net)
 {
 	if (flags & CLONE_NEWNET)
 		return ERR_PTR(-EINVAL);
 	return old_net;
-}
-
-struct net *get_net_ns_by_fd(int fd)
-{
-	return ERR_PTR(-EINVAL);
 }
 #endif
 
@@ -405,8 +386,7 @@ static int __init net_ns_init(void)
 pure_initcall(net_ns_init);
 
 #ifdef CONFIG_NET_NS
-static int __register_pernet_operations(struct list_head *list,
-					struct pernet_operations *ops)
+static int __register_pernet_operations(struct list_head *list, struct pernet_operations *ops)
 {
 	struct net *net;
 	int error;
@@ -466,7 +446,8 @@ static void __unregister_pernet_operations(struct pernet_operations *ops)
 
 #endif /* CONFIG_NET_NS */
 
-static DEFINE_IDA(net_generic_ids);
+//static DEFINE_IDA(net_generic_ids);
+struct ida net_generic_ids = IDA_INIT(net_generic_ids);
 
 static int register_pernet_operations(struct list_head *list,
 				      struct pernet_operations *ops)
@@ -522,7 +503,8 @@ static void unregister_pernet_operations(struct pernet_operations *ops)
  *	are called in the reverse of the order with which they were
  *	registered.
  */
-int register_pernet_subsys(struct pernet_operations *ops)
+ //register_pernet_subsys注册的所有的网络命名空间子系统都加入到 static struct list_head *first_device = &pernet_list;这个链表里
+int register_pernet_subsys(struct pernet_operations *ops) //ops在setup_net中的ops_init执行ops->init
 {
 	int error;
 	mutex_lock(&net_mutex);
@@ -598,39 +580,3 @@ void unregister_pernet_device(struct pernet_operations *ops)
 	mutex_unlock(&net_mutex);
 }
 EXPORT_SYMBOL_GPL(unregister_pernet_device);
-
-#ifdef CONFIG_NET_NS
-static void *netns_get(struct task_struct *task)
-{
-	struct net *net = NULL;
-	struct nsproxy *nsproxy;
-
-	rcu_read_lock();
-	nsproxy = task_nsproxy(task);
-	if (nsproxy)
-		net = get_net(nsproxy->net_ns);
-	rcu_read_unlock();
-
-	return net;
-}
-
-static void netns_put(void *ns)
-{
-	put_net(ns);
-}
-
-static int netns_install(struct nsproxy *nsproxy, void *ns)
-{
-	put_net(nsproxy->net_ns);
-	nsproxy->net_ns = get_net(ns);
-	return 0;
-}
-
-const struct proc_ns_operations netns_operations = {
-	.name		= "net",
-	.type		= CLONE_NEWNET,
-	.get		= netns_get,
-	.put		= netns_put,
-	.install	= netns_install,
-};
-#endif

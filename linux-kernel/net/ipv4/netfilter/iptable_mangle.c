@@ -22,6 +22,7 @@ MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Netfilter Core Team <coreteam@netfilter.org>");
 MODULE_DESCRIPTION("iptables mangle table");
 
+//iptable的三个mange filter nat表的内核对应hook为MANGLE_VALID_HOOKS  FILTER_VALID_HOOKS   NAT_VALID_HOOKS
 #define MANGLE_VALID_HOOKS ((1 << NF_INET_PRE_ROUTING) | \
 			    (1 << NF_INET_LOCAL_IN) | \
 			    (1 << NF_INET_FORWARD) | \
@@ -60,7 +61,7 @@ ipt_mangle_out(struct sk_buff *skb, const struct net_device *out)
 	ret = ipt_do_table(skb, NF_INET_LOCAL_OUT, NULL, out,
 			   dev_net(out)->ipv4.iptable_mangle);
 	/* Reroute for ANY change. */
-	if (ret != NF_DROP && ret != NF_STOLEN) {
+	if (ret != NF_DROP && ret != NF_STOLEN && ret != NF_QUEUE) {
 		iph = ip_hdr(skb);
 
 		if (iph->saddr != saddr ||

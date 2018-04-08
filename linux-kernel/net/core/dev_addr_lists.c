@@ -13,14 +13,13 @@
 
 #include <linux/netdevice.h>
 #include <linux/rtnetlink.h>
-#include <linux/export.h>
 #include <linux/list.h>
 #include <linux/proc_fs.h>
 
 /*
  * General list handling functions
  */
-
+//首先查找list链表中是否已经存在相同的hwaddr，如果存在则增加引用计数，否则创建一个新的hwaddr节点，让后加入该链表
 static int __hw_addr_add_ex(struct netdev_hw_addr_list *list,
 			    unsigned char *addr, int addr_len,
 			    unsigned char addr_type, bool global)
@@ -31,6 +30,11 @@ static int __hw_addr_add_ex(struct netdev_hw_addr_list *list,
 	if (addr_len > MAX_ADDR_LEN)
 		return -EINVAL;
 
+    /* 
+        * dev_addr_init调用该函数时下面不会执行，因为
+        * 参数list为空
+        *
+    */
 	list_for_each_entry(ha, &list->list, list) {
 		if (!memcmp(ha->addr, addr, addr_len) &&
 		    ha->type == addr_type) {
@@ -41,7 +45,7 @@ static int __hw_addr_add_ex(struct netdev_hw_addr_list *list,
 				else
 					ha->global_use = true;
 			}
-			ha->refcount++;
+			ha->refcount++; /* 如果要添加的地址相同，则只增加引用计数*/
 			return 0;
 		}
 	}
@@ -69,6 +73,14 @@ static int __hw_addr_add(struct netdev_hw_addr_list *list, unsigned char *addr,
 	return __hw_addr_add_ex(list, addr, addr_len, addr_type, false);
 }
 
+static void ha_rcu_free(struct rcu_head *head)
+{
+	struct netdev_hw_addr *ha;
+
+	ha = container_of(head, struct netdev_hw_addr, rcu_head);
+	kfree(ha);
+}
+
 static int __hw_addr_del_ex(struct netdev_hw_addr_list *list,
 			    unsigned char *addr, int addr_len,
 			    unsigned char addr_type, bool global)
@@ -87,7 +99,7 @@ static int __hw_addr_del_ex(struct netdev_hw_addr_list *list,
 			if (--ha->refcount)
 				return 0;
 			list_del_rcu(&ha->list);
-			kfree_rcu(ha, rcu_head);
+			call_rcu(&ha->rcu_head, ha_rcu_free);
 			list->count--;
 			return 0;
 		}
@@ -137,7 +149,7 @@ void __hw_addr_del_multiple(struct netdev_hw_addr_list *to_list,
 
 	list_for_each_entry(ha, &from_list->list, list) {
 		type = addr_type ? addr_type : ha->type;
-		__hw_addr_del(to_list, ha->addr, addr_len, type);
+		__hw_addr_del(to_list, ha->addr, addr_len, addr_type);
 	}
 }
 EXPORT_SYMBOL(__hw_addr_del_multiple);
@@ -190,7 +202,7 @@ void __hw_addr_flush(struct netdev_hw_addr_list *list)
 
 	list_for_each_entry_safe(ha, tmp, &list->list, list) {
 		list_del_rcu(&ha->list);
-		kfree_rcu(ha, rcu_head);
+		call_rcu(&ha->rcu_head, ha_rcu_free);
 	}
 	list->count = 0;
 }
@@ -244,7 +256,7 @@ int dev_addr_init(struct net_device *dev)
 	__hw_addr_init(&dev->dev_addrs);
 	memset(addr, 0, sizeof(addr));
 	err = __hw_addr_add(&dev->dev_addrs, addr, sizeof(addr),
-			    NETDEV_HW_ADDR_T_LAN);
+			    NETDEV_HW_ADDR_T_LAN);//首先查找list链表中是否已经存在相同的hwaddr，如果存在则增加引用计数，否则创建一个新的hwaddr节点，让后加入该链表
 	if (!err) {
 		/*
 		 * Get the first (previously created) address from the list
@@ -350,8 +362,8 @@ EXPORT_SYMBOL(dev_addr_add_multiple);
 /**
  *	dev_addr_del_multiple - Delete device addresses by another device
  *	@to_dev: device where the addresses will be deleted
- *	@from_dev: device supplying the addresses to be deleted
- *	@addr_type: address type - 0 means type will be used from from_dev
+ *	@from_dev: device by which addresses the addresses will be deleted
+ *	@addr_type: address type - 0 means type will used from from_dev
  *
  *	Deletes addresses in to device by the list of addresses in from device.
  *
@@ -592,8 +604,8 @@ EXPORT_SYMBOL(dev_mc_del_global);
  *	addresses that have no users left. The source device must be
  *	locked by netif_tx_lock_bh.
  *
- *	This function is intended to be called from the ndo_set_rx_mode
- *	function of layered software devices.
+ *	This function is intended to be called from the dev->set_multicast_list
+ *	or dev->set_rx_mode function of layered software devices.
  */
 int dev_mc_sync(struct net_device *to, struct net_device *from)
 {
@@ -696,7 +708,8 @@ static const struct seq_operations dev_mc_seq_ops = {
 
 static int dev_mc_seq_open(struct inode *inode, struct file *file)
 {
-	return dev_seq_open_ops(inode, file, &dev_mc_seq_ops);
+	return seq_open_net(inode, file, &dev_mc_seq_ops,
+			    sizeof(struct seq_net_private));
 }
 
 static const struct file_operations dev_mc_seq_fops = {
@@ -711,7 +724,7 @@ static const struct file_operations dev_mc_seq_fops = {
 
 static int __net_init dev_mc_net_init(struct net *net)
 {
-	if (!proc_net_fops_create(net, "dev_mcast", 0, &dev_mc_seq_fops))
+	if (!proc_net_fops_create(net, "dev_mcast", 0, &dev_mc_seq_fops)) //ip组播相关
 		return -ENOMEM;
 	return 0;
 }
@@ -726,6 +739,7 @@ static struct pernet_operations __net_initdata dev_mc_net_ops = {
 	.exit = dev_mc_net_exit,
 };
 
+//初始化网络设备层的组播模块，增加/proc/net/dev_mcast用来存放与IP组播有关的参数信息
 void __init dev_mcast_init(void)
 {
 	register_pernet_subsys(&dev_mc_net_ops);

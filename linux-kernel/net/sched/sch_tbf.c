@@ -96,13 +96,14 @@
 	It is passed to the default bfifo qdisc - if the inner qdisc is
 	changed the limit is not effective anymore.
 */
-
-struct tbf_sched_data {
+//也就是tbf的参数配置信息，如tbf rate 220kbit latency 50ms burst 1540
+struct tbf_sched_data  //tbf_init里面初始化
+{
 /* Parameters */
 	u32		limit;		/* Maximal length of backlog: bytes */
 	u32		buffer;		/* Token bucket depth/rate: MUST BE >= MTU/B */
 	u32		mtu;
-	u32		max_size;
+	u32		max_size;////tc qdisc add dev eth0 root handle 1: tbf latency 50ms  burst 10000 rate 256kbit中的burst参数设置
 	struct qdisc_rate_table	*R_tab;
 	struct qdisc_rate_table	*P_tab;
 
@@ -110,14 +111,14 @@ struct tbf_sched_data {
 	long	tokens;			/* Current number of B tokens */
 	long	ptokens;		/* Current number of P tokens */
 	psched_time_t	t_c;		/* Time check-point */
-	struct Qdisc	*qdisc;		/* Inner qdisc, default - bfifo queue */
+	struct Qdisc	*qdisc;		/* Inner qdisc, default - bfifo queue */  //该qdisc指向的是一个子bfifo_qdisc_ops
 	struct qdisc_watchdog watchdog;	/* Watchdog timer */
 };
 
-#define L2T(q, L)   qdisc_l2t((q)->R_tab, L)
-#define L2T_P(q, L) qdisc_l2t((q)->P_tab, L)
+#define L2T(q,L)   qdisc_l2t((q)->R_tab,L)
+#define L2T_P(q,L) qdisc_l2t((q)->P_tab,L)
 
-static int tbf_enqueue(struct sk_buff *skb, struct Qdisc *sch)
+static int tbf_enqueue(struct sk_buff *skb, struct Qdisc* sch)
 {
 	struct tbf_sched_data *q = qdisc_priv(sch);
 	int ret;
@@ -126,17 +127,19 @@ static int tbf_enqueue(struct sk_buff *skb, struct Qdisc *sch)
 		return qdisc_reshape_fail(skb, sch);
 
 	ret = qdisc_enqueue(skb, q->qdisc);
-	if (ret != NET_XMIT_SUCCESS) {
+	if (ret != 0) {
 		if (net_xmit_drop_count(ret))
 			sch->qstats.drops++;
 		return ret;
 	}
 
 	sch->q.qlen++;
-	return NET_XMIT_SUCCESS;
+	sch->bstats.bytes += qdisc_pkt_len(skb);
+	sch->bstats.packets++;
+	return 0;
 }
 
-static unsigned int tbf_drop(struct Qdisc *sch)
+static unsigned int tbf_drop(struct Qdisc* sch)
 {
 	struct tbf_sched_data *q = qdisc_priv(sch);
 	unsigned int len = 0;
@@ -148,7 +151,7 @@ static unsigned int tbf_drop(struct Qdisc *sch)
 	return len;
 }
 
-static struct sk_buff *tbf_dequeue(struct Qdisc *sch)
+static struct sk_buff *tbf_dequeue(struct Qdisc* sch)
 {
 	struct tbf_sched_data *q = qdisc_priv(sch);
 	struct sk_buff *skb;
@@ -184,8 +187,7 @@ static struct sk_buff *tbf_dequeue(struct Qdisc *sch)
 			q->tokens = toks;
 			q->ptokens = ptoks;
 			sch->q.qlen--;
-			qdisc_unthrottled(sch);
-			qdisc_bstats_update(sch, skb);
+			sch->flags &= ~TCQ_F_THROTTLED;
 			return skb;
 		}
 
@@ -208,7 +210,7 @@ static struct sk_buff *tbf_dequeue(struct Qdisc *sch)
 	return NULL;
 }
 
-static void tbf_reset(struct Qdisc *sch)
+static void tbf_reset(struct Qdisc* sch)
 {
 	struct tbf_sched_data *q = qdisc_priv(sch);
 
@@ -226,7 +228,8 @@ static const struct nla_policy tbf_policy[TCA_TBF_MAX + 1] = {
 	[TCA_TBF_PTAB]	= { .type = NLA_BINARY, .len = TC_RTAB_SIZE },
 };
 
-static int tbf_change(struct Qdisc *sch, struct nlattr *opt)
+//tc qdisc add dev eth0 root handle 1: tbf latency 50ms  burst 10000 rate 256kbit ,opt为tbf后面的参数
+static int tbf_change(struct Qdisc* sch, struct nlattr *opt)
 {
 	int err;
 	struct tbf_sched_data *q = qdisc_priv(sch);
@@ -235,7 +238,7 @@ static int tbf_change(struct Qdisc *sch, struct nlattr *opt)
 	struct qdisc_rate_table *rtab = NULL;
 	struct qdisc_rate_table *ptab = NULL;
 	struct Qdisc *child = NULL;
-	int max_size, n;
+	int max_size,n;
 
 	err = nla_parse_nested(tb, TCA_TBF_PTAB, opt, tbf_policy);
 	if (err < 0)
@@ -258,28 +261,25 @@ static int tbf_change(struct Qdisc *sch, struct nlattr *opt)
 	}
 
 	for (n = 0; n < 256; n++)
-		if (rtab->data[n] > qopt->buffer)
-			break;
-	max_size = (n << qopt->rate.cell_log) - 1;
+		if (rtab->data[n] > qopt->buffer) break;
+	max_size = (n << qopt->rate.cell_log)-1;
 	if (ptab) {
 		int size;
 
 		for (n = 0; n < 256; n++)
-			if (ptab->data[n] > qopt->mtu)
-				break;
-		size = (n << qopt->peakrate.cell_log) - 1;
-		if (size < max_size)
-			max_size = size;
+			if (ptab->data[n] > qopt->mtu) break;
+		size = (n << qopt->peakrate.cell_log)-1;
+		if (size < max_size) max_size = size;
 	}
 	if (max_size < 0)
 		goto done;
 
-	if (q->qdisc != &noop_qdisc) {
+	if (q->qdisc != &noop_qdisc) {//在tbf_init中，q->qdisc = &noop_qdisc
 		err = fifo_set_limit(q->qdisc, qopt->limit);
 		if (err)
 			goto done;
 	} else if (qopt->limit > 0) {
-		child = fifo_create_dflt(sch, &bfifo_qdisc_ops, qopt->limit);
+		child = fifo_create_dflt(sch, &bfifo_qdisc_ops, qopt->limit); //默认为tbf_sched_data->qdisc创建一个bfifo_qdisc_ops
 		if (IS_ERR(child)) {
 			err = PTR_ERR(child);
 			goto done;
@@ -290,7 +290,7 @@ static int tbf_change(struct Qdisc *sch, struct nlattr *opt)
 	if (child) {
 		qdisc_tree_decrease_qlen(q->qdisc, q->qdisc->q.qlen);
 		qdisc_destroy(q->qdisc);
-		q->qdisc = child;
+		q->qdisc = child;//把新创建的tbf_sched_data->qdisc = bfifo_qdisc_ops
 	}
 	q->limit = qopt->limit;
 	q->mtu = qopt->mtu;
@@ -312,7 +312,8 @@ done:
 	return err;
 }
 
-static int tbf_init(struct Qdisc *sch, struct nlattr *opt)
+//sch为新创建的qdisc，见
+static int tbf_init(struct Qdisc* sch, struct nlattr *opt)
 {
 	struct tbf_sched_data *q = qdisc_priv(sch);
 
@@ -424,7 +425,8 @@ static void tbf_walk(struct Qdisc *sch, struct qdisc_walker *walker)
 	}
 }
 
-static const struct Qdisc_class_ops tbf_class_ops = {
+static const struct Qdisc_class_ops tbf_class_ops =
+{
 	.graft		=	tbf_graft,
 	.leaf		=	tbf_leaf,
 	.get		=	tbf_get,
@@ -433,7 +435,8 @@ static const struct Qdisc_class_ops tbf_class_ops = {
 	.dump		=	tbf_dump_class,
 };
 
-static struct Qdisc_ops tbf_qdisc_ops __read_mostly = {
+/*pfifo_qdisc_ops tbf_qdisc_ops sfq_qdisc_ops prio_class_ops这几个都为出口，ingress_qdisc_ops为入口 */
+static struct Qdisc_ops tbf_qdisc_ops ;//__read_mostly = {
 	.next		=	NULL,
 	.cl_ops		=	&tbf_class_ops,
 	.id		=	"tbf",
@@ -442,7 +445,7 @@ static struct Qdisc_ops tbf_qdisc_ops __read_mostly = {
 	.dequeue	=	tbf_dequeue,
 	.peek		=	qdisc_peek_dequeued,
 	.drop		=	tbf_drop,
-	.init		=	tbf_init,
+	.init		=	tbf_init, //qdisc_create中调用
 	.reset		=	tbf_reset,
 	.destroy	=	tbf_destroy,
 	.change		=	tbf_change,

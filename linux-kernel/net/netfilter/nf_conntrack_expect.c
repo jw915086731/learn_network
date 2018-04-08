@@ -7,7 +7,10 @@
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
  * published by the Free Software Foundation.
- */
+ nf_conntrack_expect.c文件中的nf_ct_expect_related_report(struct nf_conntrack_expect *expect, u32 pid, int report)来注册nf_conntrack_expect结构。
+ 期望连接是指对于那些活动协议而言，例如对FTP协议，FTP协议的连接分为控制连接和数据连接，对于这种类型的协议，连接跟踪认为这两次连接应该归结到一个跟踪里，这样，当FTP的控制连接建立起来后，它的数据连接就是控制连接的期望连接，而数据连接就是控制连接的master。期望连接可用如下的数据结构表示：
+ 参考:http://blog.csdn.net/ye_shizhe/article/details/17331947
+*/
 
 #include <linux/types.h>
 #include <linux/netfilter.h>
@@ -20,8 +23,6 @@
 #include <linux/percpu.h>
 #include <linux/kernel.h>
 #include <linux/jhash.h>
-#include <linux/moduleparam.h>
-#include <linux/export.h>
 #include <net/net_namespace.h>
 
 #include <net/netfilter/nf_conntrack.h>
@@ -31,37 +32,42 @@
 #include <net/netfilter/nf_conntrack_tuple.h>
 #include <net/netfilter/nf_conntrack_zones.h>
 
+
+/*
+ nf_conntrack_expect.c文件中的nf_ct_expect_related_report(struct nf_conntrack_expect *expect, u32 pid, int report)来注册nf_conntrack_expect结构。
+ 期望连接是指对于那些活动协议而言，例如对FTP协议，FTP协议的连接分为控制连接和数据连接，对于这种类型的协议，连接跟踪认为这两次连接应该归结到一个跟踪里，这样，当FTP的控制连接建立起来后，它的数据连接就是控制连接的期望连接，而数据连接就是控制连接的master。期望连接可用如下的数据结构表示：
+ 参考:http://blog.csdn.net/ye_shizhe/article/details/17331947
+*/
+
 unsigned int nf_ct_expect_hsize __read_mostly;
 EXPORT_SYMBOL_GPL(nf_ct_expect_hsize);
 
+static unsigned int nf_ct_expect_hash_rnd __read_mostly;
 unsigned int nf_ct_expect_max __read_mostly;
+static int nf_ct_expect_hash_rnd_initted __read_mostly;
 
-static struct kmem_cache *nf_ct_expect_cachep __read_mostly;
-
-static HLIST_HEAD(nf_ct_userspace_expect_list);
+//static struct kmem_cache *nf_ct_expect_cachep __read_mostly;
+static struct kmem_cache *nf_ct_expect_cachep;
 
 /* nf_conntrack_expect helper functions */
-void nf_ct_unlink_expect_report(struct nf_conntrack_expect *exp,
-				u32 pid, int report)
+void nf_ct_unlink_expect(struct nf_conntrack_expect *exp)
 {
 	struct nf_conn_help *master_help = nfct_help(exp->master);
 	struct net *net = nf_ct_exp_net(exp);
 
+	NF_CT_ASSERT(master_help);
 	NF_CT_ASSERT(!timer_pending(&exp->timeout));
 
 	hlist_del_rcu(&exp->hnode);
 	net->ct.expect_count--;
 
 	hlist_del(&exp->lnode);
-	if (!(exp->flags & NF_CT_EXPECT_USERSPACE))
-		master_help->expecting[exp->class]--;
-
-	nf_ct_expect_event_report(IPEXP_DESTROY, exp, pid, report);
+	master_help->expecting[exp->class]--;
 	nf_ct_expect_put(exp);
 
 	NF_CT_STAT_INC(net, expect_delete);
 }
-EXPORT_SYMBOL_GPL(nf_ct_unlink_expect_report);
+EXPORT_SYMBOL_GPL(nf_ct_unlink_expect);
 
 static void nf_ct_expectation_timed_out(unsigned long ul_expect)
 {
@@ -73,17 +79,20 @@ static void nf_ct_expectation_timed_out(unsigned long ul_expect)
 	nf_ct_expect_put(exp);
 }
 
+//计算orig_tuple在net.ct->expect_hash[]的键值
 static unsigned int nf_ct_expect_dst_hash(const struct nf_conntrack_tuple *tuple)
 {
 	unsigned int hash;
 
-	if (unlikely(!nf_conntrack_hash_rnd)) {
-		init_nf_conntrack_hash_rnd();
+	if (unlikely(!nf_ct_expect_hash_rnd_initted)) {
+		get_random_bytes(&nf_ct_expect_hash_rnd,
+				 sizeof(nf_ct_expect_hash_rnd));
+		nf_ct_expect_hash_rnd_initted = 1;
 	}
 
 	hash = jhash2(tuple->dst.u3.all, ARRAY_SIZE(tuple->dst.u3.all),
 		      (((tuple->dst.protonum ^ tuple->src.l3num) << 16) |
-		       (__force __u16)tuple->dst.u.all) ^ nf_conntrack_hash_rnd);
+		       (__force __u16)tuple->dst.u.all) ^ nf_ct_expect_hash_rnd);
 	return ((u64)hash * nf_ct_expect_hsize) >> 32;
 }
 
@@ -127,6 +136,7 @@ EXPORT_SYMBOL_GPL(nf_ct_expect_find_get);
 
 /* If an expectation for this connection is found, it gets delete from
  * global list then returned. */
+ //使用orig_tuple在net.ct->expect_hash[]桶里面查找expect项
 struct nf_conntrack_expect *
 nf_ct_find_expectation(struct net *net, u16 zone,
 		       const struct nf_conntrack_tuple *tuple)
@@ -170,6 +180,7 @@ nf_ct_find_expectation(struct net *net, u16 zone,
 }
 
 /* delete all expectations for this conntrack */
+//释放ct连接上的expect项
 void nf_ct_remove_expectations(struct nf_conn *ct)
 {
 	struct nf_conn_help *help = nfct_help(ct);
@@ -246,6 +257,7 @@ struct nf_conntrack_expect *nf_ct_expect_alloc(struct nf_conn *me)
 }
 EXPORT_SYMBOL_GPL(nf_ct_expect_alloc);
 
+//构建一个nf_conntrack_expect结构
 void nf_ct_expect_init(struct nf_conntrack_expect *exp, unsigned int class,
 		       u_int8_t family,
 		       const union nf_inet_addr *saddr,
@@ -307,6 +319,7 @@ static void nf_ct_expect_free_rcu(struct rcu_head *head)
 	kmem_cache_free(nf_ct_expect_cachep, exp);
 }
 
+//如果exp->use为0，则释放exp
 void nf_ct_expect_put(struct nf_conntrack_expect *exp)
 {
 	if (atomic_dec_and_test(&exp->use))
@@ -321,29 +334,21 @@ static void nf_ct_expect_insert(struct nf_conntrack_expect *exp)
 	const struct nf_conntrack_expect_policy *p;
 	unsigned int h = nf_ct_expect_dst_hash(&exp->tuple);
 
-	/* two references : one for hash insert, one for the timer */
-	atomic_add(2, &exp->use);
+	atomic_inc(&exp->use);
 
-	if (master_help) {
-		hlist_add_head(&exp->lnode, &master_help->expectations);
-		master_help->expecting[exp->class]++;
-	} else if (exp->flags & NF_CT_EXPECT_USERSPACE)
-		hlist_add_head(&exp->lnode, &nf_ct_userspace_expect_list);
+	hlist_add_head(&exp->lnode, &master_help->expectations);
+	master_help->expecting[exp->class]++;
 
 	hlist_add_head_rcu(&exp->hnode, &net->ct.expect_hash[h]);
 	net->ct.expect_count++;
 
 	setup_timer(&exp->timeout, nf_ct_expectation_timed_out,
 		    (unsigned long)exp);
-	if (master_help) {
-		p = &rcu_dereference_protected(
-				master_help->helper,
-				lockdep_is_held(&nf_conntrack_lock)
-				)->expect_policy[exp->class];
-		exp->timeout.expires = jiffies + p->timeout * HZ;
-	}
+	p = &master_help->helper->expect_policy[exp->class];
+	exp->timeout.expires = jiffies + p->timeout * HZ;
 	add_timer(&exp->timeout);
 
+	atomic_inc(&exp->use);
 	NF_CT_STAT_INC(net, expect_create);
 }
 
@@ -374,10 +379,7 @@ static inline int refresh_timer(struct nf_conntrack_expect *i)
 	if (!del_timer(&i->timeout))
 		return 0;
 
-	p = &rcu_dereference_protected(
-		master_help->helper,
-		lockdep_is_held(&nf_conntrack_lock)
-		)->expect_policy[i->class];
+	p = &master_help->helper->expect_policy[i->class];
 	i->timeout.expires = jiffies + p->timeout * HZ;
 	add_timer(&i->timeout);
 	return 1;
@@ -394,9 +396,7 @@ static inline int __nf_ct_expect_check(struct nf_conntrack_expect *expect)
 	unsigned int h;
 	int ret = 1;
 
-	/* Don't allow expectations created from kernel-space with no helper */
-	if (!(expect->flags & NF_CT_EXPECT_USERSPACE) &&
-	    (!master_help || (master_help && !master_help->helper))) {
+	if (!master_help->helper) {
 		ret = -ESHUTDOWN;
 		goto out;
 	}
@@ -414,19 +414,13 @@ static inline int __nf_ct_expect_check(struct nf_conntrack_expect *expect)
 		}
 	}
 	/* Will be over limit? */
-	if (master_help) {
-		p = &rcu_dereference_protected(
-			master_help->helper,
-			lockdep_is_held(&nf_conntrack_lock)
-			)->expect_policy[expect->class];
-		if (p->max_expected &&
-		    master_help->expecting[expect->class] >= p->max_expected) {
-			evict_oldest_expect(master, expect);
-			if (master_help->expecting[expect->class]
-						>= p->max_expected) {
-				ret = -EMFILE;
-				goto out;
-			}
+	p = &master_help->helper->expect_policy[expect->class];
+	if (p->max_expected &&
+	    master_help->expecting[expect->class] >= p->max_expected) {
+		evict_oldest_expect(master, expect);
+		if (master_help->expecting[expect->class] >= p->max_expected) {
+			ret = -EMFILE;
+			goto out;
 		}
 	}
 
@@ -440,6 +434,7 @@ out:
 	return ret;
 }
 
+//将expect挂载到net->ct.expect_hash	
 int nf_ct_expect_related_report(struct nf_conntrack_expect *expect, 
 				u32 pid, int report)
 {
@@ -461,21 +456,6 @@ out:
 }
 EXPORT_SYMBOL_GPL(nf_ct_expect_related_report);
 
-void nf_ct_remove_userspace_expectations(void)
-{
-	struct nf_conntrack_expect *exp;
-	struct hlist_node *n, *next;
-
-	hlist_for_each_entry_safe(exp, n, next,
-				  &nf_ct_userspace_expect_list, lnode) {
-		if (del_timer(&exp->timeout)) {
-			nf_ct_unlink_expect(exp);
-			nf_ct_expect_put(exp);
-		}
-	}
-}
-EXPORT_SYMBOL_GPL(nf_ct_remove_userspace_expectations);
-
 #ifdef CONFIG_PROC_FS
 struct ct_expect_iter_state {
 	struct seq_net_private p;
@@ -489,7 +469,7 @@ static struct hlist_node *ct_expect_get_first(struct seq_file *seq)
 	struct hlist_node *n;
 
 	for (st->bucket = 0; st->bucket < nf_ct_expect_hsize; st->bucket++) {
-		n = rcu_dereference(hlist_first_rcu(&net->ct.expect_hash[st->bucket]));
+		n = rcu_dereference(net->ct.expect_hash[st->bucket].first);
 		if (n)
 			return n;
 	}
@@ -502,11 +482,11 @@ static struct hlist_node *ct_expect_get_next(struct seq_file *seq,
 	struct net *net = seq_file_net(seq);
 	struct ct_expect_iter_state *st = seq->private;
 
-	head = rcu_dereference(hlist_next_rcu(head));
+	head = rcu_dereference(head->next);
 	while (head == NULL) {
 		if (++st->bucket >= nf_ct_expect_hsize)
 			return NULL;
-		head = rcu_dereference(hlist_first_rcu(&net->ct.expect_hash[st->bucket]));
+		head = rcu_dereference(net->ct.expect_hash[st->bucket].first);
 	}
 	return head;
 }
@@ -566,12 +546,8 @@ static int exp_seq_show(struct seq_file *s, void *v)
 		seq_printf(s, "PERMANENT");
 		delim = ",";
 	}
-	if (expect->flags & NF_CT_EXPECT_INACTIVE) {
+	if (expect->flags & NF_CT_EXPECT_INACTIVE)
 		seq_printf(s, "%sINACTIVE", delim);
-		delim = ",";
-	}
-	if (expect->flags & NF_CT_EXPECT_USERSPACE)
-		seq_printf(s, "%sUSERSPACE", delim);
 
 	helper = rcu_dereference(nfct_help(expect->master)->helper);
 	if (helper) {
@@ -641,7 +617,8 @@ int nf_conntrack_expect_init(struct net *net)
 	}
 
 	net->ct.expect_count = 0;
-	net->ct.expect_hash = nf_ct_alloc_hashtable(&nf_ct_expect_hsize, 0);
+	net->ct.expect_hash = nf_ct_alloc_hashtable(&nf_ct_expect_hsize,
+						  &net->ct.expect_vmalloc, 0);
 	if (net->ct.expect_hash == NULL)
 		goto err1;
 
@@ -663,7 +640,8 @@ err3:
 	if (net_eq(net, &init_net))
 		kmem_cache_destroy(nf_ct_expect_cachep);
 err2:
-	nf_ct_free_hashtable(net->ct.expect_hash, nf_ct_expect_hsize);
+	nf_ct_free_hashtable(net->ct.expect_hash, net->ct.expect_vmalloc,
+			     nf_ct_expect_hsize);
 err1:
 	return err;
 }
@@ -675,5 +653,6 @@ void nf_conntrack_expect_fini(struct net *net)
 		rcu_barrier(); /* Wait for call_rcu() before destroy */
 		kmem_cache_destroy(nf_ct_expect_cachep);
 	}
-	nf_ct_free_hashtable(net->ct.expect_hash, nf_ct_expect_hsize);
+	nf_ct_free_hashtable(net->ct.expect_hash, net->ct.expect_vmalloc,
+			     nf_ct_expect_hsize);
 }

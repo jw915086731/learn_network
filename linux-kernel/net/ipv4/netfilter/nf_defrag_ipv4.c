@@ -5,7 +5,7 @@
  * it under the terms of the GNU General Public License version 2 as
  * published by the Free Software Foundation.
  */
-
+//yang 该模块没有调用任何模块
 #include <linux/types.h>
 #include <linux/ip.h>
 #include <linux/netfilter.h>
@@ -23,6 +23,7 @@
 #include <net/netfilter/nf_conntrack_zones.h>
 
 /* Returns new sk_buff, or NULL */
+//只有当IP分片重组成功时，nf_ct_ipv4_gather_frags才会返回为0。也就是说，当IP分片重组不成功，即IP分片被kernel分片模块缓存时，该函数返回为NF_STOLEN。
 static int nf_ct_ipv4_gather_frags(struct sk_buff *skb, u_int32_t user)
 {
 	int err;
@@ -60,19 +61,14 @@ static enum ip_defrag_users nf_ct_defrag_user(unsigned int hooknum,
 		return IP_DEFRAG_CONNTRACK_OUT + zone;
 }
 
+/*对于PREROUTING这个HOOK点的分片重组，无疑对于分片而言，只是进入HOOK，暂时保存在里面，直到所有分片都来了切重组成功 后才一次性流出这个HOOK点*/
+//frag分片 defrag分片重组
 static unsigned int ipv4_conntrack_defrag(unsigned int hooknum,
 					  struct sk_buff *skb,
 					  const struct net_device *in,
 					  const struct net_device *out,
 					  int (*okfn)(struct sk_buff *))
 {
-	struct sock *sk = skb->sk;
-	struct inet_sock *inet = inet_sk(skb->sk);
-
-	if (sk && (sk->sk_family == PF_INET) &&
-	    inet->nodefrag)
-		return NF_ACCEPT;
-
 #if defined(CONFIG_NF_CONNTRACK) || defined(CONFIG_NF_CONNTRACK_MODULE)
 #if !defined(CONFIG_NF_NAT) && !defined(CONFIG_NF_NAT_MODULE)
 	/* Previously seen (loopback)?  Ignore.  Do this before
@@ -82,13 +78,35 @@ static unsigned int ipv4_conntrack_defrag(unsigned int hooknum,
 #endif
 #endif
 	/* Gather fragments. */
-	if (ip_is_fragment(ip_hdr(skb))) {
+	if (ip_hdr(skb)->frag_off & htons(IP_MF | IP_OFFSET)) {
 		enum ip_defrag_users user = nf_ct_defrag_user(hooknum, skb);
 		if (nf_ct_ipv4_gather_frags(skb, user))
 			return NF_STOLEN;
 	}
 	return NF_ACCEPT;
 }
+
+//只有当IP分片重组成功时，nf_ct_ipv4_gather_frags才会返回为0。也就是说，当IP分片重组不成功，即IP分片被kernel分片模块缓存时，该函数返回为NF_STOLEN。
+unsigned int ipv4_conntrack_defrag2(unsigned int hooknum,
+					  struct sk_buff *skb)
+{
+#if defined(CONFIG_NF_CONNTRACK) || defined(CONFIG_NF_CONNTRACK_MODULE)
+#if !defined(CONFIG_NF_NAT) && !defined(CONFIG_NF_NAT_MODULE)
+	/* Previously seen (loopback)?  Ignore.  Do this before
+	   fragment check. */
+	if (skb->nfct && !nf_ct_is_template((struct nf_conn *)skb->nfct))
+		return NF_ACCEPT;
+#endif
+#endif
+	/* Gather fragments. */
+	if (ip_hdr(skb)->frag_off & htons(IP_MF | IP_OFFSET)) {
+		enum ip_defrag_users user = nf_ct_defrag_user(hooknum, skb);
+		if (nf_ct_ipv4_gather_frags(skb, user))
+			return NF_STOLEN;
+	}
+	return NF_ACCEPT;
+}
+EXPORT_SYMBOL_GPL(ipv4_conntrack_defrag2);
 
 static struct nf_hook_ops ipv4_defrag_ops[] = {
 	{

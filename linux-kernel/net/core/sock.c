@@ -128,8 +128,6 @@
 
 #include <linux/filter.h>
 
-#include <trace/events/sock.h>
-
 #ifdef CONFIG_INET
 #include <net/tcp.h>
 #endif
@@ -159,8 +157,8 @@ static const char *const af_family_key_strings[AF_MAX+1] = {
   "sk_lock-27"       , "sk_lock-28"          , "sk_lock-AF_CAN"      ,
   "sk_lock-AF_TIPC"  , "sk_lock-AF_BLUETOOTH", "sk_lock-IUCV"        ,
   "sk_lock-AF_RXRPC" , "sk_lock-AF_ISDN"     , "sk_lock-AF_PHONET"   ,
-  "sk_lock-AF_IEEE802154", "sk_lock-AF_CAIF" , "sk_lock-AF_ALG"      ,
-  "sk_lock-AF_NFC"   , "sk_lock-AF_MAX"
+  "sk_lock-AF_IEEE802154",
+  "sk_lock-AF_MAX"
 };
 static const char *const af_family_slock_key_strings[AF_MAX+1] = {
   "slock-AF_UNSPEC", "slock-AF_UNIX"     , "slock-AF_INET"     ,
@@ -175,8 +173,8 @@ static const char *const af_family_slock_key_strings[AF_MAX+1] = {
   "slock-27"       , "slock-28"          , "slock-AF_CAN"      ,
   "slock-AF_TIPC"  , "slock-AF_BLUETOOTH", "slock-AF_IUCV"     ,
   "slock-AF_RXRPC" , "slock-AF_ISDN"     , "slock-AF_PHONET"   ,
-  "slock-AF_IEEE802154", "slock-AF_CAIF" , "slock-AF_ALG"      ,
-  "slock-AF_NFC"   , "slock-AF_MAX"
+  "slock-AF_IEEE802154",
+  "slock-AF_MAX"
 };
 static const char *const af_family_clock_key_strings[AF_MAX+1] = {
   "clock-AF_UNSPEC", "clock-AF_UNIX"     , "clock-AF_INET"     ,
@@ -191,8 +189,8 @@ static const char *const af_family_clock_key_strings[AF_MAX+1] = {
   "clock-27"       , "clock-28"          , "clock-AF_CAN"      ,
   "clock-AF_TIPC"  , "clock-AF_BLUETOOTH", "clock-AF_IUCV"     ,
   "clock-AF_RXRPC" , "clock-AF_ISDN"     , "clock-AF_PHONET"   ,
-  "clock-AF_IEEE802154", "clock-AF_CAIF" , "clock-AF_ALG"      ,
-  "clock-AF_NFC"   , "clock-AF_MAX"
+  "clock-AF_IEEE802154",
+  "clock-AF_MAX"
 };
 
 /*
@@ -207,7 +205,7 @@ static struct lock_class_key af_callback_keys[AF_MAX];
  * not depend upon such differences.
  */
 #define _SK_MEM_PACKETS		256
-#define _SK_MEM_OVERHEAD	SKB_TRUESIZE(256)
+#define _SK_MEM_OVERHEAD	(sizeof(struct sk_buff) + 256)
 #define SK_WMEM_MAX		(_SK_MEM_OVERHEAD * _SK_MEM_PACKETS)
 #define SK_RMEM_MAX		(_SK_MEM_OVERHEAD * _SK_MEM_PACKETS)
 
@@ -217,7 +215,7 @@ __u32 sysctl_rmem_max __read_mostly = SK_RMEM_MAX;
 __u32 sysctl_wmem_default __read_mostly = SK_WMEM_MAX;
 __u32 sysctl_rmem_default __read_mostly = SK_RMEM_MAX;
 
-/* Maximal space eaten by iovec or ancillary data plus some space */
+/* Maximal space eaten by iovec or ancilliary data plus some space */
 int sysctl_optmem_max __read_mostly = sizeof(unsigned long)*(2*UIO_MAXIOV+512);
 EXPORT_SYMBOL(sysctl_optmem_max);
 
@@ -288,9 +286,12 @@ int sock_queue_rcv_skb(struct sock *sk, struct sk_buff *skb)
 	unsigned long flags;
 	struct sk_buff_head *list = &sk->sk_receive_queue;
 
-	if (atomic_read(&sk->sk_rmem_alloc) >= sk->sk_rcvbuf) {
+	/* Cast sk->rcvbuf to unsigned... It's pointless, but reduces
+	   number of warnings when compiling with -W --ANK
+	 */
+	if (atomic_read(&sk->sk_rmem_alloc) + skb->truesize >=
+	    (unsigned)sk->sk_rcvbuf) {
 		atomic_inc(&sk->sk_drops);
-		trace_sock_rcvqueue_full(sk, skb);
 		return -ENOMEM;
 	}
 
@@ -383,7 +384,7 @@ struct dst_entry *__sk_dst_check(struct sock *sk, u32 cookie)
 
 	if (dst && dst->obsolete && dst->ops->check(dst, cookie) == NULL) {
 		sk_tx_queue_clear(sk);
-		RCU_INIT_POINTER(sk->sk_dst_cache, NULL);
+		rcu_assign_pointer(sk->sk_dst_cache, NULL);
 		dst_release(dst);
 		return NULL;
 	}
@@ -734,7 +735,10 @@ set_rcvbuf:
 		/* We implement the SO_SNDLOWAT etc to
 		   not be settable (1003.1g 5.3) */
 	case SO_RXQ_OVFL:
-		sock_valbool_flag(sk, SOCK_RXQ_OVFL, valbool);
+		if (valbool)
+			sock_set_flag(sk, SOCK_RXQ_OVFL);
+		else
+			sock_reset_flag(sk, SOCK_RXQ_OVFL);
 		break;
 	default:
 		ret = -ENOPROTOOPT;
@@ -912,15 +916,11 @@ int sock_getsockopt(struct socket *sock, int level, int optname,
 		break;
 
 	case SO_PEERCRED:
-	{
-		struct ucred peercred;
-		if (len > sizeof(peercred))
-			len = sizeof(peercred);
-		cred_to_ucred(sk->sk_peer_pid, sk->sk_peer_cred, &peercred);
-		if (copy_to_user(optval, &peercred, len))
+		if (len > sizeof(sk->sk_peercred))
+			len = sizeof(sk->sk_peercred);
+		if (copy_to_user(optval, &sk->sk_peercred, len))
 			return -EFAULT;
 		goto lenout;
-	}
 
 	case SO_PEERNAME:
 	{
@@ -988,18 +988,17 @@ static inline void sock_lock_init(struct sock *sk)
 /*
  * Copy all fields from osk to nsk but nsk->sk_refcnt must not change yet,
  * even temporarly, because of RCU lookups. sk_node should also be left as is.
- * We must not copy fields between sk_dontcopy_begin and sk_dontcopy_end
  */
 static void sock_copy(struct sock *nsk, const struct sock *osk)
 {
 #ifdef CONFIG_SECURITY_NETWORK
 	void *sptr = nsk->sk_security;
 #endif
-	memcpy(nsk, osk, offsetof(struct sock, sk_dontcopy_begin));
-
-	memcpy(&nsk->sk_dontcopy_end, &osk->sk_dontcopy_end,
-	       osk->sk_prot->obj_size - offsetof(struct sock, sk_dontcopy_end));
-
+	BUILD_BUG_ON(offsetof(struct sock, sk_copy_start) !=
+		     sizeof(osk->sk_node) + sizeof(osk->sk_refcnt) +
+		     sizeof(osk->sk_tx_queue_mapping));
+	memcpy(&nsk->sk_copy_start, &osk->sk_copy_start,
+	       osk->sk_prot->obj_size - offsetof(struct sock, sk_copy_start));
 #ifdef CONFIG_SECURITY_NETWORK
 	nsk->sk_security = sptr;
 	security_sk_clone(osk, nsk);
@@ -1007,35 +1006,12 @@ static void sock_copy(struct sock *nsk, const struct sock *osk)
 }
 
 /*
- * caches using SLAB_DESTROY_BY_RCU should let .next pointer from nulls nodes
- * un-modified. Special care is taken when initializing object to zero.
- */
-static inline void sk_prot_clear_nulls(struct sock *sk, int size)
-{
-	if (offsetof(struct sock, sk_node.next) != 0)
-		memset(sk, 0, offsetof(struct sock, sk_node.next));
-	memset(&sk->sk_node.pprev, 0,
-	       size - offsetof(struct sock, sk_node.pprev));
-}
+上面的代码中首先判断高速缓存中是否可用，如果不可用，直接在内存分配空间，不过大小都是prot->obj_size。
+如果是TCP协议中的tcp_prot中指明该属性的大小为.obj_size	= sizeof(struct tcp_sock)。
+所以，程序中给struct sock指针分配的不是该结构体的实际大小，而是大于其实际大小，以便其扩展套接字的属性占用。
+*/ //tcp传输层协议集tcp_prot， udp传输层协议集udp_port  netlink proto为netlink_proto
 
-void sk_prot_clear_portaddr_nulls(struct sock *sk, int size)
-{
-	unsigned long nulls1, nulls2;
-
-	nulls1 = offsetof(struct sock, __sk_common.skc_node.next);
-	nulls2 = offsetof(struct sock, __sk_common.skc_portaddr_node.next);
-	if (nulls1 > nulls2)
-		swap(nulls1, nulls2);
-
-	if (nulls1 != 0)
-		memset((char *)sk, 0, nulls1);
-	memset((char *)sk + nulls1 + sizeof(void *), 0,
-	       nulls2 - nulls1 - sizeof(void *));
-	memset((char *)sk + nulls2 + sizeof(void *), 0,
-	       size - nulls2 - sizeof(void *));
-}
-EXPORT_SYMBOL(sk_prot_clear_portaddr_nulls);
-
+//该函数实际上不是开辟的struct sock大小的空间，而是开辟的tcp_prot、udp_port或者netlink_proto中obj_size大小的空间
 static struct sock *sk_prot_alloc(struct proto *prot, gfp_t priority,
 		int family)
 {
@@ -1044,16 +1020,23 @@ static struct sock *sk_prot_alloc(struct proto *prot, gfp_t priority,
 
 	slab = prot->slab;
 	if (slab != NULL) {
-		sk = kmem_cache_alloc(slab, priority & ~__GFP_ZERO);
+		sk = kmem_cache_alloc(slab, priority & ~__GFP_ZERO); ////inet_init中的rc = proto_register(&tcp_prot, 1);确定了缓存，在创建struct sock的时候的空间大小就是这个tcp_prot udp_prot raw_prot中的obj_size
 		if (!sk)
 			return sk;
 		if (priority & __GFP_ZERO) {
-			if (prot->clear_sk)
-				prot->clear_sk(sk, prot->obj_size);
-			else
-				sk_prot_clear_nulls(sk, prot->obj_size);
+			/*
+			 * caches using SLAB_DESTROY_BY_RCU should let
+			 * sk_node.next un-modified. Special care is taken
+			 * when initializing object to zero.
+			 */
+			if (offsetof(struct sock, sk_node.next) != 0)
+				memset(sk, 0, offsetof(struct sock, sk_node.next));
+			memset(&sk->sk_node.pprev, 0,
+			       prot->obj_size - offsetof(struct sock,
+							 sk_node.pprev));
 		}
-	} else
+	}
+	else
 		sk = kmalloc(prot->obj_size, priority);
 
 	if (sk != NULL) {
@@ -1098,11 +1081,8 @@ static void sk_prot_free(struct proto *prot, struct sock *sk)
 #ifdef CONFIG_CGROUPS
 void sock_update_classid(struct sock *sk)
 {
-	u32 classid;
+	u32 classid = task_cls_classid(current);
 
-	rcu_read_lock();  /* doing current task, which cannot vanish. */
-	classid = task_cls_classid(current);
-	rcu_read_unlock();
 	if (classid && classid != sk->sk_classid)
 		sk->sk_classid = classid;
 }
@@ -1115,7 +1095,18 @@ EXPORT_SYMBOL(sock_update_classid);
  *	@family: protocol family
  *	@priority: for allocation (%GFP_KERNEL, %GFP_ATOMIC, etc)
  *	@prot: struct proto associated with this new sock instance
- */
+ 不会发生内存非法访问吗？！那就是在分配的时候并不只是分配的struct sock结构体大小的存储空间！
+
+ 
+上面的代码中首先判断高速缓存中是否可用，如果不可用，直接在内存分配空间，不过大小都是prot->obj_size。
+如果是TCP协议中的tcp_prot中指明该属性的大小为.obj_size	= sizeof(struct tcp_sock)。
+所以，程序中给struct sock指针分配的不是该结构体的实际大小，而是大于其实际大小，以便其扩展套接字的属性占用。
+ */  //proto参数 tcp传输层协议集tcp_prot， udp传输层协议集udp_prot  netlink proto为netlink_proto
+
+ //sk_alloc创建struct sock,  sock_alloc创建struct socket   sk_alloc创建的sock赋值给了sock_alloc的sk，即socket->sk = sock
+//如果是netlink，则这里开辟的空间大小为sizeof(struct netlink_sock)，见netlink_proto   tcp_prot为sizeof(struct tcp_sock)  
+//udp_prot为sizeof(struct udp_sock)  raw_prot为sizeof(struct raw_sock)
+////还有个开辟sock空间的地方是inet_csk_clone，sk_alloc也开辟sock空间
 struct sock *sk_alloc(struct net *net, int family, gfp_t priority,
 		      struct proto *prot)
 {
@@ -1151,7 +1142,7 @@ static void __sk_free(struct sock *sk)
 				       atomic_read(&sk->sk_wmem_alloc) == 0);
 	if (filter) {
 		sk_filter_uncharge(sk, filter);
-		RCU_INIT_POINTER(sk->sk_filter, NULL);
+		rcu_assign_pointer(sk->sk_filter, NULL);
 	}
 
 	sock_disable_timestamp(sk, SOCK_TIMESTAMP);
@@ -1161,9 +1152,6 @@ static void __sk_free(struct sock *sk)
 		printk(KERN_DEBUG "%s: optmem leakage (%d bytes) detected.\n",
 		       __func__, atomic_read(&sk->sk_omem_alloc));
 
-	if (sk->sk_peer_cred)
-		put_cred(sk->sk_peer_cred);
-	put_pid(sk->sk_peer_pid);
 	put_net(sock_net(sk));
 	sk_prot_free(sk->sk_prot_creator, sk);
 }
@@ -1171,7 +1159,7 @@ static void __sk_free(struct sock *sk)
 void sk_free(struct sock *sk)
 {
 	/*
-	 * We subtract one from sk_wmem_alloc and can know if
+	 * We substract one from sk_wmem_alloc and can know if
 	 * some packets are still in some tx queue.
 	 * If not null, sock_wfree() will call __sk_free(sk) later
 	 */
@@ -1181,10 +1169,10 @@ void sk_free(struct sock *sk)
 EXPORT_SYMBOL(sk_free);
 
 /*
- * Last sock_put should drop reference to sk->sk_net. It has already
- * been dropped in sk_change_net. Taking reference to stopping namespace
+ * Last sock_put should drop referrence to sk->sk_net. It has already
+ * been dropped in sk_change_net. Taking referrence to stopping namespace
  * is not an option.
- * Take reference to a socket to remove it from hash _alive_ and after that
+ * Take referrence to a socket to remove it from hash _alive_ and after that
  * destroy it in the context of init_net.
  */
 void sk_release_kernel(struct sock *sk)
@@ -1204,7 +1192,7 @@ struct sock *sk_clone(const struct sock *sk, const gfp_t priority)
 {
 	struct sock *newsk;
 
-	newsk = sk_prot_alloc(sk->sk_prot, priority, sk->sk_family);
+	newsk = sk_prot_alloc(sk->sk_prot, priority, sk->sk_family);//sk_alloc也是调用的这个函数
 	if (newsk != NULL) {
 		struct sk_filter *filter;
 
@@ -1245,7 +1233,7 @@ struct sock *sk_clone(const struct sock *sk, const gfp_t priority)
 		sock_reset_flag(newsk, SOCK_DONE);
 		skb_queue_head_init(&newsk->sk_error_queue);
 
-		filter = rcu_dereference_protected(newsk->sk_filter, 1);
+		filter = newsk->sk_filter;
 		if (filter != NULL)
 			sk_filter_charge(newsk, filter);
 
@@ -1253,7 +1241,6 @@ struct sock *sk_clone(const struct sock *sk, const gfp_t priority)
 			/* It is still raw copy of parent, so invalidate
 			 * destructor and make plain sk_free() */
 			newsk->sk_destruct = NULL;
-			bh_unlock_sock(newsk);
 			sk_free(newsk);
 			newsk = NULL;
 			goto out;
@@ -1299,8 +1286,8 @@ void sk_setup_caps(struct sock *sk, struct dst_entry *dst)
 {
 	__sk_dst_set(sk, dst);
 	sk->sk_route_caps = dst->dev->features;
-	if (sk->sk_route_caps & NETIF_F_GSO)
-		sk->sk_route_caps |= NETIF_F_GSO_SOFTWARE;
+	if (sk->sk_route_caps & NETIF_F_GSO) 
+		sk->sk_route_caps |= NETIF_F_GSO_SOFTWARE;  //支持GSO，一定支持TSO
 	sk->sk_route_caps &= ~sk->sk_route_nocaps;
 	if (sk_can_gso(sk)) {
 		if (dst->header_len) {
@@ -1333,7 +1320,7 @@ void __init sk_init(void)
 
 /*
  * Write buffer destructor automatically called from kfree_skb.
- */
+ *///见skb_set_owner_w
 void sock_wfree(struct sk_buff *skb)
 {
 	struct sock *sk = skb->sk;
@@ -1344,7 +1331,7 @@ void sock_wfree(struct sk_buff *skb)
 		 * Keep a reference on sk_wmem_alloc, this will be released
 		 * after sk_write_space() call
 		 */
-		atomic_sub(len - 1, &sk->sk_wmem_alloc);
+		atomic_sub(len - 1, &sk->sk_wmem_alloc); 
 		sk->sk_write_space(sk);
 		len = 1;
 	}
@@ -1352,7 +1339,7 @@ void sock_wfree(struct sk_buff *skb)
 	 * if sk_wmem_alloc reaches 0, we must finish what sk_free()
 	 * could not do because of in-flight packets
 	 */
-	if (atomic_sub_and_test(len, &sk->sk_wmem_alloc))
+	if (atomic_sub_and_test(len, &sk->sk_wmem_alloc))////在sk_alloc的时候初始化设置为1，然后在skb_set_owner_w加上SKB长度，当SKB发送出去后，在减去该SKB的长度，所以这个值当数据发送后其值始终是1，不会执行sock_wfree
 		__sk_free(sk);
 }
 EXPORT_SYMBOL(sock_wfree);
@@ -1363,10 +1350,9 @@ EXPORT_SYMBOL(sock_wfree);
 void sock_rfree(struct sk_buff *skb)
 {
 	struct sock *sk = skb->sk;
-	unsigned int len = skb->truesize;
 
-	atomic_sub(len, &sk->sk_rmem_alloc);
-	sk_mem_uncharge(sk, len);
+	atomic_sub(skb->truesize, &sk->sk_rmem_alloc);
+	sk_mem_uncharge(skb->sk, skb->truesize);
 }
 EXPORT_SYMBOL(sock_rfree);
 
@@ -1375,9 +1361,9 @@ int sock_i_uid(struct sock *sk)
 {
 	int uid;
 
-	read_lock_bh(&sk->sk_callback_lock);
+	read_lock(&sk->sk_callback_lock);
 	uid = sk->sk_socket ? SOCK_INODE(sk->sk_socket)->i_uid : 0;
-	read_unlock_bh(&sk->sk_callback_lock);
+	read_unlock(&sk->sk_callback_lock);
 	return uid;
 }
 EXPORT_SYMBOL(sock_i_uid);
@@ -1386,9 +1372,9 @@ unsigned long sock_i_ino(struct sock *sk)
 {
 	unsigned long ino;
 
-	read_lock_bh(&sk->sk_callback_lock);
+	read_lock(&sk->sk_callback_lock);
 	ino = sk->sk_socket ? SOCK_INODE(sk->sk_socket)->i_ino : 0;
-	read_unlock_bh(&sk->sk_callback_lock);
+	read_unlock(&sk->sk_callback_lock);
 	return ino;
 }
 EXPORT_SYMBOL(sock_i_ino);
@@ -1396,6 +1382,18 @@ EXPORT_SYMBOL(sock_i_ino);
 /*
  * Allocate a skb from the socket's send buffer.
  */
+/*
+ * 分配发送缓存。在TCP中，只是在构造SYN+ACK时使用，
+ * 发送用户数据时通常使用sk_stream_alloc_skb()分配发送缓存
+ *
+ * @sk: 待分配SKB的锁住传输控制块
+ * @size: 待分配SKB的大小
+ * @force: 是否强制分配。当强制分配时，即使为发送而分配
+ *             的所有SKB数据区的总大小达到上限，仍然可以分配SKB
+ * @priority:内存分配方式
+ 套接字发送数据的时候，struct sock和SKB的关系可以通过sock_alloc_send_pskb(UDP和RAW套接字用这个)函数详细了解。TCP在构造SYN+ACK时使
+ 用sock_wmalloc，发送用户数据时通常使用sk_stream_alloc_skb()分配发送缓存。另外，辅助缓存(也叫选项缓存)的分配使用sock_kmalloc函数
+*/
 struct sk_buff *sock_wmalloc(struct sock *sk, unsigned long size, int force,
 			     gfp_t priority)
 {
@@ -1429,6 +1427,13 @@ struct sk_buff *sock_rmalloc(struct sock *sk, unsigned long size, int force,
 /*
  * Allocate a memory block from the socket's option memory buffer.
  */
+ /*
+ * 用于分配有关选项的缓存，比如包括套接字的过滤器、
+ * 组播设置等。在分配前会检测待分配的长度与该传输
+ * 控制块已分配辅助缓存长度之和是否超过sysctl_optmem_max，
+ * 如果超过，则分配失败。否则，则调用kmalloc分配缓存，
+ * 成功后则累计sk_omem_alloc
+ */ //该函数的释放函数是sock_kfree_s
 void *sock_kmalloc(struct sock *sk, int size, gfp_t priority)
 {
 	if ((unsigned)size <= sysctl_optmem_max &&
@@ -1460,11 +1465,24 @@ EXPORT_SYMBOL(sock_kfree_s);
 /* It is almost wait_for_tcp_memory minus release_sock/lock_sock.
    I think, these locks should be removed for datagram sockets.
  */
+
+ /* 
+ * 用于等待分配可用于输出的内存
+ */
 static long sock_wait_for_wmem(struct sock *sk, long timeo)
 {
 	DEFINE_WAIT(wait);
 
 	clear_bit(SOCK_ASYNC_NOSPACE, &sk->sk_socket->flags);
+
+	 /*
+        * 循环等待，直到满足以下条件之一便结束循环:
+        *  1. 操作超时
+        *  2. 接收到信号 
+        *  3. 为发送而分配的所有SKB数据区的总大小已经低于上限
+        *  4. 发送通道被关闭
+        *  5. 发生了致命错误
+        */
 	for (;;) {
 		if (!timeo)
 			break;
@@ -1488,7 +1506,21 @@ static long sock_wait_for_wmem(struct sock *sk, long timeo)
 /*
  *	Generic send/receive buffer handlers
  */
-
+ /*
+ * 主要为UDP和RAW套接字分配用于输出的SKB。与sock_wmalloc相比，在分配过程中
+ * 考虑的细节比较多，支持检测传输控制块已发生的错误、检测关闭套接字的标志、
+ * 阻塞等特性
+ *
+ * @sk: 待分配的SKB的宿主传输控制块
+ * @size: 待分配SKB的大小
+ * @noblock: 分配SKB时是否允许阻塞
+ * @errcode: 返回操作的错误码
+ */
+/*
+ 套接字发送数据的时候，struct sock和SKB的关系可以通过sock_alloc_send_pskb(UDP和RAW套接字用这个)函数详细了解。TCP在构造SYN+ACK时使用sock_wmalloc，发送用户数据时通常使用sk_stream_alloc_skb()分配发送缓存.另外，辅助缓存(也叫选项缓存)的分配使用sock_kmalloc函数
+ * @header_len:待分配SKB线性数据区的大小
+ * @data_len: 待分配SKB的SG类型的聚合分散I/O的数据区的大小
+ */
 struct sk_buff *sock_alloc_send_pskb(struct sock *sk, unsigned long header_len,
 				     unsigned long data_len, int noblock,
 				     int *errcode)
@@ -1502,18 +1534,23 @@ struct sk_buff *sock_alloc_send_pskb(struct sock *sk, unsigned long header_len,
 	if (gfp_mask & __GFP_WAIT)
 		gfp_mask |= __GFP_REPEAT;
 
+    /* 获取允许操作超时的时间值*/
 	timeo = sock_sndtimeo(sk, noblock);
-	while (1) {
-		err = sock_error(sk);
+	while (1) {  /* 循环处理，直到成功分配SKB或操作超时为止*/
+		err = sock_error(sk);  /*检测传输控制块是否发生过指明错误，如果有，则结束分配SKB，返回相应错误码*/
 		if (err != 0)
 			goto failure;
 
 		err = -EPIPE;
-		if (sk->sk_shutdown & SEND_SHUTDOWN)
+		if (sk->sk_shutdown & SEND_SHUTDOWN)  /* 如果关闭了输出通道，则结束分配SKB，返回相应错误码*/
 			goto failure;
 
+         /*
+           * 只有传输控制块因发送而分配的所有SKB数据区的总大小
+           * 未达到上限，才能继续分配SKB
+           */
 		if (atomic_read(&sk->sk_wmem_alloc) < sk->sk_sndbuf) {
-			skb = alloc_skb(header_len, gfp_mask);
+			skb = alloc_skb(header_len, gfp_mask);/* 头部空间在这里开辟，数据区空间在下面的page中开辟 */
 			if (skb) {
 				int npages;
 				int i;
@@ -1527,6 +1564,7 @@ struct sk_buff *sock_alloc_send_pskb(struct sock *sk, unsigned long header_len,
 				skb_shinfo(skb)->nr_frags = npages;
 				for (i = 0; i < npages; i++) {
 					struct page *page;
+					skb_frag_t *frag;
 
 					page = alloc_pages(sk->sk_allocation, 0);
 					if (!page) {
@@ -1536,11 +1574,12 @@ struct sk_buff *sock_alloc_send_pskb(struct sock *sk, unsigned long header_len,
 						goto failure;
 					}
 
-					__skb_fill_page_desc(skb, i,
-							page, 0,
-							(data_len >= PAGE_SIZE ?
-							 PAGE_SIZE :
-							 data_len));
+					frag = &skb_shinfo(skb)->frags[i];
+					frag->page = page;
+					frag->page_offset = 0;
+					frag->size = (data_len >= PAGE_SIZE ?
+						      PAGE_SIZE :
+						      data_len);
 					data_len -= PAGE_SIZE;
 				}
 
@@ -1550,13 +1589,23 @@ struct sk_buff *sock_alloc_send_pskb(struct sock *sk, unsigned long header_len,
 			err = -ENOBUFS;
 			goto failure;
 		}
+		  /*
+              * 如果传输控制块因发送而分配的所有SKB数据区的总大小
+              * 达到上限，则暂时不能分配SKB，并在套接字中设置
+              * SOCK_ASYNC_NOSPACE和SOCK_NOSPACE标志
+              */
 		set_bit(SOCK_ASYNC_NOSPACE, &sk->sk_socket->flags);
 		set_bit(SOCK_NOSPACE, &sk->sk_socket->flags);
 		err = -EAGAIN;
-		if (!timeo)
+		if (!timeo) /* 如果分配过程超时，则返回相应错误码*/
 			goto failure;
-		if (signal_pending(current))
+		if (signal_pending(current)) /* 如果该进程得到信号，则返回相应错误码*/
 			goto interrupted;
+
+		 /*
+           * 如果操作未超时也没有其他异常，则在允许的超时
+           * 时间内继续等待可分配的内存
+           */
 		timeo = sock_wait_for_wmem(sk, timeo);
 	}
 
@@ -1571,6 +1620,16 @@ failure:
 }
 EXPORT_SYMBOL(sock_alloc_send_pskb);
 
+/*
+ * 主要为UDP和RAW套接字分配用于输出的SKB。与sock_wmalloc相比，在分配过程中
+ * 考虑的细节比较多，支持检测传输控制块已发生的错误、检测关闭套接字的标志、
+ * 阻塞等特性
+ *
+ * @sk: 待分配的SKB的宿主传输控制块
+ * @size: 待分配SKB的大小
+ * @noblock: 分配SKB时是否允许阻塞
+ * @errcode: 返回操作的错误码
+ */
 struct sk_buff *sock_alloc_send_skb(struct sock *sk, unsigned long size,
 				    int noblock, int *errcode)
 {
@@ -1579,8 +1638,6 @@ struct sk_buff *sock_alloc_send_skb(struct sock *sk, unsigned long size,
 EXPORT_SYMBOL(sock_alloc_send_skb);
 
 static void __lock_sock(struct sock *sk)
-	__releases(&sk->sk_lock.slock)
-	__acquires(&sk->sk_lock.slock)
 {
 	DEFINE_WAIT(wait);
 
@@ -1596,9 +1653,47 @@ static void __lock_sock(struct sock *sk)
 	finish_wait(&sk->sk_lock.wq, &wait);
 }
 
+/*
+ * __release_sock是对后备队列进行操作，如果后备队列中还存在SKB，
+ * 则遍历后备队列，将后备队列中的SKB通过传输控制块的sk_backlog_rcv
+ * 接口进行处理。由于处理是通过传输控制块的sk_backlog_rcv接口进行，
+ * 因此处理过程与不同的传输层协议相关。比如，TCP中会将数据复制
+ * 到用户空间的缓存区中或添加到接收队列中
+ */
 static void __release_sock(struct sock *sk)
-	__releases(&sk->sk_lock.slock)
-	__acquires(&sk->sk_lock.slock)
+{
+	struct sk_buff *skb = sk->sk_backlog.head;
+
+	do {
+		sk->sk_backlog.head = sk->sk_backlog.tail = NULL;
+		bh_unlock_sock(sk);
+
+		do {
+			struct sk_buff *next = skb->next;
+
+			skb->next = NULL;
+			/*
+			 * 如果是关闭套接字，tcp_v4_do_rcv()中处理时，如果后备队列
+			 * 中有skb包需要接受，则会发送rst包给对端
+			 */
+			sk_backlog_rcv(sk, skb);
+
+			/*
+			 * We are in process context here with softirqs
+			 * disabled, use cond_resched_softirq() to preempt.
+			 * This is safe to do because we've taken the backlog
+			 * queue private:
+			 */
+			cond_resched_softirq();
+
+			skb = next;
+		} while (skb != NULL);
+
+		bh_lock_sock(sk);
+	} while ((skb = sk->sk_backlog.head) != NULL);
+}
+
+static void __release_sock1(struct sock *sk)
 {
 	struct sk_buff *skb = sk->sk_backlog.head;
 
@@ -1668,36 +1763,80 @@ EXPORT_SYMBOL(sk_wait_data);
  *	rmem allocation. This function assumes that protocols which have
  *	memory_pressure use sk_wmem_queued as write buffer accounting.
  */
+ /*
+ * 无论是为发送而分配SKB，还是将报文接收到TCP
+ * 传输层，都需要对新进入传输控制块的缓存进行
+ * 确认。确认时如果套接字缓存中的数据长度大于
+ * 预分配量，则需进行全面的确认，这个过程由
+ * __sk_mem_schedule()实现。
+ * @size:要确认的缓存长度
+ * @kind:类型，0为发送缓存，1为接收缓存。
+ *///这是对整个proto中的所有socket内存使用情况进行检查    
+ //下面这些变量只是为了增加变量的值，表示预先分配，但实际上是没有分片内存的，例如在发送SKB之前，需要开辟空间，在开辟空间前需要判断知道能现在否开辟空间,如果可以
+ //则才真真开辟内存SKB->LEN空间，可以参考tcp_sendmsg
 int __sk_mem_schedule(struct sock *sk, int size, int kind)
 {
 	struct proto *prot = sk->sk_prot;
+	  /*
+	 * 根据待确认的缓存长度，向上取整
+	 * 获得所占用的页面数。因为是向上取整，
+	 * 所以amt的值必定大于等于1
+	 */
 	int amt = sk_mem_pages(size);
-	long allocated;
+	int allocated;
+   /*
+	 * 在确认之前需先调整预分配量，加上之前计算得到的
+	 * 页面字节数，调整整个TCP传输层已分配内存，加上之
+	 * 前计算得到的页面数。
+	 */
+	sk->sk_forward_alloc += amt * SK_MEM_QUANTUM;//预分配这么多内存
+	allocated = atomic_add_return(amt, prot->memory_allocated);
 
-	sk->sk_forward_alloc += amt * SK_MEM_QUANTUM;
-	allocated = atomic_long_add_return(amt, prot->memory_allocated);
-
+    /*
+	 * 如果已分配内存低于低水平线，则将
+	 * 原先的警告状态恢复到正常状态，返
+	 * 回1，表示确认成功。
+	 */
 	/* Under limit. */
 	if (allocated <= prot->sysctl_mem[0]) {
 		if (prot->memory_pressure && *prot->memory_pressure)
 			*prot->memory_pressure = 0;
 		return 1;
 	}
+    /*
+         * 如果已分配内存高于警戒线但低于硬性
+         * 限制线，则进入警告状态。
+         */
 
 	/* Under pressure. */
 	if (allocated > prot->sysctl_mem[1])
 		if (prot->enter_memory_pressure)
 			prot->enter_memory_pressure(sk);
 
+    /*
+	 * 如果已分配内存高于硬性限制线，则
+	 * 进入警告状态，并跳转到标签suppress_allocation
+	 * 处，根据情况作处理。
+	 */
 	/* Over hard limit. */
 	if (allocated > prot->sysctl_mem[2])
 		goto suppress_allocation;
 
 	/* guarantee minimum buffer size under pressure */
-	if (kind == SK_MEM_RECV) {
+	if (kind == SK_MEM_RECV) { /* 对整个proto接收缓存比较 */
+	    /*
+		 * 如果待确认的是接收缓存，且接收队列中
+		 * 段的数据总长度小于接收缓冲区的长度上
+		 * 限，则确认成功；否则还需进一步确认。
+		 */
 		if (atomic_read(&sk->sk_rmem_alloc) < prot->sysctl_rmem[0])
 			return 1;
-	} else { /* SK_MEM_SEND */
+	} else { /* SK_MEM_SEND *//* 对整个proto发送缓存比较 */
+	        /*
+			 * 如果待确认的是发送缓存，且发送队列中
+			 * 段的数据总长度小于发送缓冲区的长度上
+			 * 限，则确认成功，否则还需进一步确认。
+			 */
 		if (sk->sk_type == SOCK_STREAM) {
 			if (sk->sk_wmem_queued < prot->sysctl_wmem[0])
 				return 1;
@@ -1706,6 +1845,11 @@ int __sk_mem_schedule(struct sock *sk, int size, int kind)
 				return 1;
 	}
 
+    /*
+	 * 如果没有进入警告状态，或者当前套接字发送队列中所有段数据总长度、接收队列
+	 * 中所有段数据总长度、预分配缓存总长度的当前系统中套接字数量的倍数这三者之
+	 * 和还小于硬性限制线，则确认成功。
+	 */
 	if (prot->memory_pressure) {
 		int alloc;
 
@@ -1719,8 +1863,18 @@ int __sk_mem_schedule(struct sock *sk, int size, int kind)
 			return 1;
 	}
 
+
+/*
+ * 处理已分配的内存高于硬性限制线的情况
+ */
 suppress_allocation:
 
+    /*
+	 * 若待确认的是发送缓存，则将传输控制块发送缓冲区的预设大小减小为已分配缓冲队列大小的一半。如果已分配缓冲队列大小与待确认长
+	 * 度之和大于sk_sndbuf，则可通过确认。而如果待确认的是接收缓存，当已分配的内存高于硬性限制线时，确认必然失败。
+	 * 
+	 * sctp协议的套接字类型也是SOCK_STREAM。
+	 */
 	if (kind == SK_MEM_SEND && sk->sk_type == SOCK_STREAM) {
 		sk_stream_moderate_sndbuf(sk);
 
@@ -1731,11 +1885,10 @@ suppress_allocation:
 			return 1;
 	}
 
-	trace_sock_exceed_buf_limit(sk, prot, allocated);
-
+    //达到内存硬性条件的上限值，则不能分配这部分空间。从这个函数返回出去后会调用sk_stream_wait_memory
 	/* Alas. Undo changes. */
 	sk->sk_forward_alloc -= amt * SK_MEM_QUANTUM;
-	atomic_long_sub(amt, prot->memory_allocated);
+	atomic_sub(amt, prot->memory_allocated);
 	return 0;
 }
 EXPORT_SYMBOL(__sk_mem_schedule);
@@ -1743,17 +1896,17 @@ EXPORT_SYMBOL(__sk_mem_schedule);
 /**
  *	__sk_reclaim - reclaim memory_allocated
  *	@sk: socket
- */
+ */ //调整预分配缓存，减少
 void __sk_mem_reclaim(struct sock *sk)
 {
 	struct proto *prot = sk->sk_prot;
 
-	atomic_long_sub(sk->sk_forward_alloc >> SK_MEM_QUANTUM_SHIFT,
+	atomic_sub(sk->sk_forward_alloc >> SK_MEM_QUANTUM_SHIFT,
 		   prot->memory_allocated);
 	sk->sk_forward_alloc &= SK_MEM_QUANTUM - 1;
 
 	if (prot->memory_pressure && *prot->memory_pressure &&
-	    (atomic_long_read(prot->memory_allocated) < prot->sysctl_mem[0]))
+	    (atomic_read(prot->memory_allocated) < prot->sysctl_mem[0]))
 		*prot->memory_pressure = 0;
 }
 EXPORT_SYMBOL(__sk_mem_reclaim);
@@ -1874,7 +2027,13 @@ EXPORT_SYMBOL(sock_no_sendpage);
 /*
  *	Default Socket Callbacks
  */
-
+ 
+/*
+ * 用于唤醒传输控制块的sk_sleep队列上的睡眠进程，是
+ * 传输控制块默认的唤醒等待该套接字的函数。该函数
+ * 设置到传输控制块的sk_state_change接口上，通常当传输
+ * 状态发生变化时调用
+ */
 static void sock_def_wakeup(struct sock *sk)
 {
 	struct socket_wq *wq;
@@ -1882,10 +2041,16 @@ static void sock_def_wakeup(struct sock *sk)
 	rcu_read_lock();
 	wq = rcu_dereference(sk->sk_wq);
 	if (wq_has_sleeper(wq))
-		wake_up_interruptible_all(&wq->wait);
+		wake_up_interruptible_all(&wq->wait); //注意，这个在其他版本上是wq->sk_sleep
 	rcu_read_unlock();
 }
 
+/*
+ * 用于唤醒传输控制块的sk_sleep队列上的睡眠进程和
+ * 通知套接字的fasync_list队列上的进程。该函数设置在
+ * sk_error_report接口上，通常当传输控制块发生错误时
+ * 被调用
+ */
 static void sock_def_error_report(struct sock *sk)
 {
 	struct socket_wq *wq;
@@ -1895,9 +2060,15 @@ static void sock_def_error_report(struct sock *sk)
 	if (wq_has_sleeper(wq))
 		wake_up_interruptible_poll(&wq->wait, POLLERR);
 	sk_wake_async(sk, SOCK_WAKE_IO, POLL_ERR);
-	rcu_read_unlock();
+    rcu_read_unlock(void)();
 }
 
+/*
+ * 用于唤醒传输控制块的sk_sleep队列上的睡眠进程和
+ * 通知套接字的fasync_list队列上的进程。该函数设置在
+ * sk_data_ready接口上，通常当传输控制块接收到数据包，
+ * 存在可读的数据之后被调用
+ */
 static void sock_def_readable(struct sock *sk, int len)
 {
 	struct socket_wq *wq;
@@ -1905,12 +2076,25 @@ static void sock_def_readable(struct sock *sk, int len)
 	rcu_read_lock();
 	wq = rcu_dereference(sk->sk_wq);
 	if (wq_has_sleeper(wq))
-		wake_up_interruptible_sync_poll(&wq->wait, POLLIN | POLLPRI |
+		wake_up_interruptible_sync_poll(&wq->wait, POLLIN |
 						POLLRDNORM | POLLRDBAND);
 	sk_wake_async(sk, SOCK_WAKE_WAITD, POLL_IN);
 	rcu_read_unlock();
 }
 
+/*
+ * sock_def_write_space(默认是这个)和sk_stream_write_space(TCP用这个)检测已使用的发送缓冲区的
+ * 大小，若其达到指定值，会唤醒传输控制块的sk_sleep队列上
+ * 的睡眠进程并通知套接字的fasync_list队列上的进程。前者为
+ * 默认的唤醒函数，而后者是TCP中的唤醒函数，两个函数的
+ * 差别在于检测已使用的发送缓存区的方式不同
+ *
+ * sock_def_write_space检测发送并分配的所有SKB数据区的总大小是否
+ * 达到了上限，而sk_stream_write_space保证可分配的控制至少达到
+ * 发送缓冲区上限的三分之一。以上两个函数设置到传输
+ * 控制块的sk_write_space接口上，通常当传输控制块的发送缓冲区
+ * 长度的上限做了修改或者释放了接收队列上的SKB时被调用
+ */
 static void sock_def_write_space(struct sock *sk)
 {
 	struct socket_wq *wq;
@@ -1939,6 +2123,11 @@ static void sock_def_destruct(struct sock *sk)
 	kfree(sk->sk_protinfo);
 }
 
+
+/*
+ * 当接收到带外数据之后，sk_send_sigurg通知等待处理
+ * 带外数据的套接字fasync_list队列上的进程
+ */
 void sk_send_sigurg(struct sock *sk)
 {
 	if (sk->sk_socket && sk->sk_socket->file)
@@ -1962,6 +2151,7 @@ void sk_stop_timer(struct sock *sk, struct timer_list* timer)
 }
 EXPORT_SYMBOL(sk_stop_timer);
 
+//初始化sock结构体，并建立sock与socket之间的引用关系
 void sock_init_data(struct socket *sock, struct sock *sk)
 {
 	skb_queue_head_init(&sk->sk_receive_queue);
@@ -2005,8 +2195,9 @@ void sock_init_data(struct socket *sock, struct sock *sk)
 	sk->sk_sndmsg_page	=	NULL;
 	sk->sk_sndmsg_off	=	0;
 
-	sk->sk_peer_pid 	=	NULL;
-	sk->sk_peer_cred	=	NULL;
+	sk->sk_peercred.pid 	=	0;
+	sk->sk_peercred.uid	=	-1;
+	sk->sk_peercred.gid	=	-1;
 	sk->sk_write_pending	=	0;
 	sk->sk_rcvlowat		=	1;
 	sk->sk_rcvtimeo		=	MAX_SCHEDULE_TIMEOUT;
@@ -2027,15 +2218,27 @@ EXPORT_SYMBOL(sock_init_data);
 void lock_sock_nested(struct sock *sk, int subclass)
 {
 	might_sleep();
+
+ /* 上锁slock自旋锁并禁止软中断，保护对owned的写操作*/
 	spin_lock_bh(&sk->sk_lock.slock);
+
+	/*
+        * 现在可以对owned进行写操作，但是此时如果owned已被设置，
+        * 表示所在传输控制块已被其他进程锁定，因此需要__lock_sock
+        * 进行等待，知道锁定它的进程解锁为止
+        */
 	if (sk->sk_lock.owned)
 		__lock_sock(sk);
+
+	 /* 所调用进程对此传输控制块上锁*/
 	sk->sk_lock.owned = 1;
+	 /* 完成上锁后，解锁slock自旋锁*/
 	spin_unlock(&sk->sk_lock.slock);
 	/*
 	 * The sk_lock has mutex_lock() semantics here:
 	 */
 	mutex_acquire(&sk->sk_lock.dep_map, subclass, 0, _RET_IP_);
+	 /* 开启软中断*/
 	local_bh_enable();
 }
 EXPORT_SYMBOL(lock_sock_nested);
@@ -2047,14 +2250,26 @@ void release_sock(struct sock *sk)
 	 */
 	mutex_release(&sk->sk_lock.dep_map, 1, _RET_IP_);
 
+       /* 上锁slock自旋锁并禁止软中断，保护对owned的写操作*/
 	spin_lock_bh(&sk->sk_lock.slock);
+       /*
+        * 如果此时后备队列中存在数据包，则调用__release_sock处理，
+        * 将数据复制到用户空间的缓冲区中或添加到接收队列中
+        */
 	if (sk->sk_backlog.tail)
 		__release_sock(sk);
+       /* 所调用进程对此传输控制块进行解锁*/
 	sk->sk_lock.owned = 0;
+       /*
+        * 在上锁并操作此传输控制块期间，如果又有其他进程等待
+        * 上锁此传输控制块，则唤醒它们
+        */
 	if (waitqueue_active(&sk->sk_lock.wq))
 		wake_up(&sk->sk_lock.wq);
+       /* 完成解锁后，解锁slock自旋锁并开启软中断 */
 	spin_unlock_bh(&sk->sk_lock.slock);
 }
+
 EXPORT_SYMBOL(release_sock);
 
 /**
@@ -2247,7 +2462,8 @@ void sk_common_release(struct sock *sk)
 EXPORT_SYMBOL(sk_common_release);
 
 static DEFINE_RWLOCK(proto_list_lock);
-static LIST_HEAD(proto_list);
+//static LIST_HEAD(proto_list);
+static list proto_list; //netlink proto :netlink_proto  tcp_prot  udp_prot都是添加到该链表中的
 
 #ifdef CONFIG_PROC_FS
 #define PROTO_INUSE_NR	64	/* should be enough for the first time */
@@ -2260,7 +2476,8 @@ static DECLARE_BITMAP(proto_inuse_idx, PROTO_INUSE_NR);
 #ifdef CONFIG_NET_NS
 void sock_prot_inuse_add(struct net *net, struct proto *prot, int val)
 {
-	__this_cpu_add(net->core.inuse->val[prot->inuse_idx], val);
+	int cpu = smp_processor_id();
+	per_cpu_ptr(net->core.inuse, cpu)->val[prot->inuse_idx] += val;
 }
 EXPORT_SYMBOL_GPL(sock_prot_inuse_add);
 
@@ -2306,7 +2523,7 @@ static DEFINE_PER_CPU(struct prot_inuse, prot_inuse);
 
 void sock_prot_inuse_add(struct net *net, struct proto *prot, int val)
 {
-	__this_cpu_add(prot_inuse.val[prot->inuse_idx], val);
+	__get_cpu_var(prot_inuse).val[prot->inuse_idx] += val;
 }
 EXPORT_SYMBOL_GPL(sock_prot_inuse_add);
 
@@ -2350,12 +2567,14 @@ static inline void release_proto_idx(struct proto *prot)
 }
 #endif
 
+//family协议族通过sock_register注册  传输层和socket层衔接接口tcp_prot udp_prot netlink_prot等通过proto_register注册   传输层接口通过inet_add_protocol(&icmp_protocol等注册 ，这些组成过程参考inet_init函数
 int proto_register(struct proto *prot, int alloc_slab)
 {
+    /* 处理需要创建用于分配控制块的slab缓存的情况 */
 	if (alloc_slab) {
 		prot->slab = kmem_cache_create(prot->name, prot->obj_size, 0,
 					SLAB_HWCACHE_ALIGN | prot->slab_flags,
-					NULL);
+					NULL); /* prot->slab高速缓冲区在创建套接字的时候最终在这里用到sk_prot_alloc */
 
 		if (prot->slab == NULL) {
 			printk(KERN_CRIT "%s: Can't create sock SLAB cache!\n",
@@ -2363,6 +2582,10 @@ int proto_register(struct proto *prot, int alloc_slab)
 			goto out;
 		}
 
+
+       /*
+         * 如果连接请求处理接口有效，则创建分配连接请求块的slab缓存
+         */
 		if (prot->rsk_prot != NULL) {
 			prot->rsk_prot->slab_name = kasprintf(GFP_KERNEL, "request_sock_%s", prot->name);
 			if (prot->rsk_prot->slab_name == NULL)
@@ -2379,6 +2602,11 @@ int proto_register(struct proto *prot, int alloc_slab)
 			}
 		}
 
+
+        /*
+         * 如果timewait控制块操作接口有效，则创建分配
+         * timewait控制块的slab缓存
+         */
 		if (prot->twsk_prot != NULL) {
 			prot->twsk_prot->twsk_slab_name = kasprintf(GFP_KERNEL, "tw_sock_%s", prot->name);
 
@@ -2473,12 +2701,12 @@ static char proto_method_implemented(const void *method)
 
 static void proto_seq_printf(struct seq_file *seq, struct proto *proto)
 {
-	seq_printf(seq, "%-9s %4u %6d  %6ld   %-3s %6u   %-3s  %-10s "
+	seq_printf(seq, "%-9s %4u %6d  %6d   %-3s %6u   %-3s  %-10s "
 			"%2c %2c %2c %2c %2c %2c %2c %2c %2c %2c %2c %2c %2c %2c %2c %2c %2c %2c %2c\n",
 		   proto->name,
 		   proto->obj_size,
 		   sock_prot_inuse_get(seq_file_net(seq), proto),
-		   proto->memory_allocated != NULL ? atomic_long_read(proto->memory_allocated) : -1L,
+		   proto->memory_allocated != NULL ? atomic_read(proto->memory_allocated) : -1,
 		   proto->memory_pressure != NULL ? *proto->memory_pressure ? "yes" : "no" : "NI",
 		   proto->max_header,
 		   proto->slab == NULL ? "no" : "yes",
@@ -2567,6 +2795,6 @@ static int __init proto_init(void)
 	return register_pernet_subsys(&proto_net_ops);
 }
 
-subsys_initcall(proto_init);
+subsys_initcall(proto_init);//传输层初始化
 
 #endif /* PROC_FS */

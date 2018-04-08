@@ -28,20 +28,31 @@
 #include <linux/spinlock.h>
 #include <net/protocol.h>
 
-const struct net_protocol __rcu *inet_protos[MAX_INET_PROTOS] __read_mostly;
+const struct net_protocol *inet_protos[MAX_INET_PROTOS] ____cacheline_aligned_in_smp;
+static DEFINE_SPINLOCK(inet_proto_lock);
 
 /*
  *	Add a protocol handler to the hash tables
  */
 
+//family协议族通过sock_register注册  传输层接口tcp_prot udp_prot netlink_prot等通过proto_register注册   IP层接口通过inet_add_protocol(&icmp_protocol等注册 ，这些组成过程参考inet_init函数
 int inet_add_protocol(const struct net_protocol *prot, unsigned char protocol)
 {
-	int hash = protocol & (MAX_INET_PROTOS - 1);
+	int hash, ret;
 
-	return !cmpxchg((const struct net_protocol **)&inet_protos[hash],
-			NULL, prot) ? 0 : -1;
+	hash = protocol & (MAX_INET_PROTOS - 1);
+
+	spin_lock_bh(&inet_proto_lock);
+	if (inet_protos[hash]) {
+		ret = -1;
+	} else {
+		inet_protos[hash] = prot;
+		ret = 0;
+	}
+	spin_unlock_bh(&inet_proto_lock);
+
+	return ret;
 }
-EXPORT_SYMBOL(inet_add_protocol);
 
 /*
  *	Remove a protocol from the hash tables.
@@ -49,13 +60,23 @@ EXPORT_SYMBOL(inet_add_protocol);
 
 int inet_del_protocol(const struct net_protocol *prot, unsigned char protocol)
 {
-	int ret, hash = protocol & (MAX_INET_PROTOS - 1);
+	int hash, ret;
 
-	ret = (cmpxchg((const struct net_protocol **)&inet_protos[hash],
-		       prot, NULL) == prot) ? 0 : -1;
+	hash = protocol & (MAX_INET_PROTOS - 1);
+
+	spin_lock_bh(&inet_proto_lock);
+	if (inet_protos[hash] == prot) {
+		inet_protos[hash] = NULL;
+		ret = 0;
+	} else {
+		ret = -1;
+	}
+	spin_unlock_bh(&inet_proto_lock);
 
 	synchronize_net();
 
 	return ret;
 }
+
+EXPORT_SYMBOL(inet_add_protocol);
 EXPORT_SYMBOL(inet_del_protocol);

@@ -85,37 +85,41 @@ static int wait_for_packet(struct sock *sk, int *err, long *timeo_p)
 {
 	int error;
 	DEFINE_WAIT_FUNC(wait, receiver_wake_function);
-
+    /* 
+     前面的操作都是初始化wait，为将socket加入wait队列作准备，这部分代码牵涉到进程调度。关于进程调度，我      只是知道一些皮毛，留在以后学习。这里只需要将其看作是一些加入wait队列的准备工作即可，并不影响理解代码      。
+     */
 	prepare_to_wait_exclusive(sk_sleep(sk), &wait, TASK_INTERRUPTIBLE);
 
 	/* Socket errors? */
 	error = sock_error(sk);
 	if (error)
 		goto out_err;
+    /* 一个完备检测。在决定wait和调用wait之间，有数据包到了，那么就不需要wait，所以这里再次检查socket      的队列是否为空 */
 
 	if (!skb_queue_empty(&sk->sk_receive_queue))
 		goto out;
 
 	/* Socket shut down? */
+	/* 完备检测。也许socket无数据包读取，因为socket已经被另外的线程关闭了。这样可以保证关闭socket的时      候，不会导致其他的socket的读写操作被阻塞。*/
 	if (sk->sk_shutdown & RCV_SHUTDOWN)
 		goto out_noerr;
 
 	/* Sequenced packets can come disconnected.
 	 * If so we report the problem
-	 */
+	 *//* 对于面向连接的socket进行检查。如果是面向连接的socket，如果不是已经建立连接或者正在监听状态的so       cket是不可能有数据包的。不然即出错*/
 	error = -ENOTCONN;
 	if (connection_based(sk) &&
 	    !(sk->sk_state == TCP_ESTABLISHED || sk->sk_state == TCP_LISTEN))
 		goto out_err;
 
 	/* handle signals */
-	if (signal_pending(current))
+	if (signal_pending(current))/* 检查是否有pending的signal，保证阻塞时，进程可以被signal唤醒 */
 		goto interrupted;
 
 	error = 0;
-	*timeo_p = schedule_timeout(*timeo_p);
+	*timeo_p = schedule_timeout(*timeo_p); /* sleep本进程，直至满足唤醒条件或者被信号唤醒——因为前面设置了TASK_INTERRUPTIBLE*/
 out:
-	finish_wait(sk_sleep(sk), &wait);
+	finish_wait(sk_sleep(sk), &wait); /* wait队列的清理工作 */
 	return error;
 interrupted:
 	error = sock_intr_errno(*timeo_p);
@@ -156,7 +160,7 @@ out_noerr:
  *	The order of the tests when we find no data waiting are specified
  *	quite explicitly by POSIX 1003.1g, don't change them without having
  *	the standard around please.
- */
+ *///从sk->sk_receive_queue队列中取出SKB
 struct sk_buff *__skb_recv_datagram(struct sock *sk, unsigned flags,
 				    int *peeked, int *err)
 {
@@ -170,6 +174,7 @@ struct sk_buff *__skb_recv_datagram(struct sock *sk, unsigned flags,
 	if (error)
 		goto no_packet;
 
+    // /* 当socket为阻塞时，获取timeout的值 */
 	timeo = sock_rcvtimeo(sk, flags & MSG_DONTWAIT);
 
 	do {
@@ -177,31 +182,41 @@ struct sk_buff *__skb_recv_datagram(struct sock *sk, unsigned flags,
 		 * interrupt level will suddenly eat the receive_queue.
 		 *
 		 * Look at current nfs client by the way...
-		 * However, this function was correct in any case. 8)
+		 * However, this function was corrent in any case. 8)
 		 */
 		unsigned long cpu_flags;
-
+         /* 
+         当查看socket是否有数据包时，需要上锁，因为需要保证其它线程不会将数据包取走。
+         */
 		spin_lock_irqsave(&sk->sk_receive_queue.lock, cpu_flags);
-		skb = skb_peek(&sk->sk_receive_queue);
+		skb = skb_peek(&sk->sk_receive_queue); /* 查看在socket的buffer中是否有数据包 */
 		if (skb) {
 			*peeked = skb->peeked;
 			if (flags & MSG_PEEK) {
+			     /* 
+                设置MSG_PEEK，表示用户不是真的要读取数据，只是一个peek调用。
+                那么并不真正读取数据
+                */
 				skb->peeked = 1;
 				atomic_inc(&skb->users);
 			} else
-				__skb_unlink(skb, &sk->sk_receive_queue);
+				__skb_unlink(skb, &sk->sk_receive_queue);//从队列中取出数据，即可看作读出数据
 		}
 		spin_unlock_irqrestore(&sk->sk_receive_queue.lock, cpu_flags);
 
-		if (skb)
+		if (skb) // 有数据包，返回skb
 			return skb;
 
+         /*
+        timeo为0，有2中情况：1种是socket为非阻塞的，第2种，即socket阻塞的时间已经超过了timeo的值，
+	那么就跳到no_packet处理 
+        */
 		/* User doesn't want to wait */
 		error = -EAGAIN;
 		if (!timeo)
 			goto no_packet;
 
-	} while (!wait_for_packet(sk, err, &timeo));
+	} while (!wait_for_packet(sk, err, &timeo));//阻塞进程，等待数据包
 
 	return NULL;
 
@@ -210,7 +225,7 @@ no_packet:
 	return NULL;
 }
 EXPORT_SYMBOL(__skb_recv_datagram);
-
+//从等待队列中接受一个数据包
 struct sk_buff *skb_recv_datagram(struct sock *sk, unsigned flags,
 				  int noblock, int *err)
 {
@@ -219,7 +234,6 @@ struct sk_buff *skb_recv_datagram(struct sock *sk, unsigned flags,
 	return __skb_recv_datagram(sk, flags | (noblock ? MSG_DONTWAIT : 0),
 				   &peeked, err);
 }
-EXPORT_SYMBOL(skb_recv_datagram);
 
 void skb_free_datagram(struct sock *sk, struct sk_buff *skb)
 {
@@ -243,7 +257,6 @@ void skb_free_datagram_locked(struct sock *sk, struct sk_buff *skb)
 	unlock_sock_fast(sk, slow);
 
 	/* skb is now orphaned, can be freed outside of locked section */
-	trace_kfree_skb(skb, skb_free_datagram_locked);
 	__kfree_skb(skb);
 }
 EXPORT_SYMBOL(skb_free_datagram_locked);
@@ -290,6 +303,7 @@ int skb_kill_datagram(struct sock *sk, struct sk_buff *skb, unsigned int flags)
 
 	return err;
 }
+
 EXPORT_SYMBOL(skb_kill_datagram);
 
 /**
@@ -300,7 +314,7 @@ EXPORT_SYMBOL(skb_kill_datagram);
  *	@len: amount of data to copy from buffer to iovec
  *
  *	Note: the iovec is modified during the copy.
- */
+ *///将skb拷贝至msghdr的iovec中
 int skb_copy_datagram_iovec(const struct sk_buff *skb, int offset,
 			    struct iovec *to, int len)
 {
@@ -324,15 +338,15 @@ int skb_copy_datagram_iovec(const struct sk_buff *skb, int offset,
 	/* Copy paged appendix. Hmm... why does this look so complicated? */
 	for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
 		int end;
-		const skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
 
 		WARN_ON(start > offset + len);
 
-		end = start + skb_frag_size(frag);
+		end = start + skb_shinfo(skb)->frags[i].size;
 		if ((copy = end - offset) > 0) {
 			int err;
 			u8  *vaddr;
-			struct page *page = skb_frag_page(frag);
+			skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
+			struct page *page = frag->page;
 
 			if (copy > len)
 				copy = len;
@@ -374,7 +388,6 @@ int skb_copy_datagram_iovec(const struct sk_buff *skb, int offset,
 fault:
 	return -EFAULT;
 }
-EXPORT_SYMBOL(skb_copy_datagram_iovec);
 
 /**
  *	skb_copy_datagram_const_iovec - Copy a datagram to an iovec.
@@ -410,15 +423,15 @@ int skb_copy_datagram_const_iovec(const struct sk_buff *skb, int offset,
 	/* Copy paged appendix. Hmm... why does this look so complicated? */
 	for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
 		int end;
-		const skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
 
 		WARN_ON(start > offset + len);
 
-		end = start + skb_frag_size(frag);
+		end = start + skb_shinfo(skb)->frags[i].size;
 		if ((copy = end - offset) > 0) {
 			int err;
 			u8  *vaddr;
-			struct page *page = skb_frag_page(frag);
+			skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
+			struct page *page = frag->page;
 
 			if (copy > len)
 				copy = len;
@@ -500,15 +513,15 @@ int skb_copy_datagram_from_iovec(struct sk_buff *skb, int offset,
 	/* Copy paged appendix. Hmm... why does this look so complicated? */
 	for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
 		int end;
-		const skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
 
 		WARN_ON(start > offset + len);
 
-		end = start + skb_frag_size(frag);
+		end = start + skb_shinfo(skb)->frags[i].size;
 		if ((copy = end - offset) > 0) {
 			int err;
 			u8  *vaddr;
-			struct page *page = skb_frag_page(frag);
+			skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
+			struct page *page = frag->page;
 
 			if (copy > len)
 				copy = len;
@@ -585,16 +598,16 @@ static int skb_copy_and_csum_datagram(const struct sk_buff *skb, int offset,
 
 	for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
 		int end;
-		const skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
 
 		WARN_ON(start > offset + len);
 
-		end = start + skb_frag_size(frag);
+		end = start + skb_shinfo(skb)->frags[i].size;
 		if ((copy = end - offset) > 0) {
 			__wsum csum2;
 			int err = 0;
 			u8  *vaddr;
-			struct page *page = skb_frag_page(frag);
+			skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
+			struct page *page = frag->page;
 
 			if (copy > len)
 				copy = len;
@@ -718,7 +731,6 @@ csum_error:
 fault:
 	return -EFAULT;
 }
-EXPORT_SYMBOL(skb_copy_and_csum_datagram_iovec);
 
 /**
  * 	datagram_poll - generic datagram poll
@@ -747,12 +759,13 @@ unsigned int datagram_poll(struct file *file, struct socket *sock,
 	if (sk->sk_err || !skb_queue_empty(&sk->sk_error_queue))
 		mask |= POLLERR;
 	if (sk->sk_shutdown & RCV_SHUTDOWN)
-		mask |= POLLRDHUP | POLLIN | POLLRDNORM;
+		mask |= POLLRDHUP;
 	if (sk->sk_shutdown == SHUTDOWN_MASK)
 		mask |= POLLHUP;
 
 	/* readable? */
-	if (!skb_queue_empty(&sk->sk_receive_queue))
+	if (!skb_queue_empty(&sk->sk_receive_queue) ||
+	    (sk->sk_shutdown & RCV_SHUTDOWN))
 		mask |= POLLIN | POLLRDNORM;
 
 	/* Connection-based need to check for termination and startup */
@@ -772,4 +785,8 @@ unsigned int datagram_poll(struct file *file, struct socket *sock,
 
 	return mask;
 }
+
 EXPORT_SYMBOL(datagram_poll);
+EXPORT_SYMBOL(skb_copy_and_csum_datagram_iovec);
+EXPORT_SYMBOL(skb_copy_datagram_iovec);
+EXPORT_SYMBOL(skb_recv_datagram);

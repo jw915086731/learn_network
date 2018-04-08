@@ -72,7 +72,6 @@
 #include <net/timewait_sock.h>
 #include <net/xfrm.h>
 #include <net/netdma.h>
-#include <net/secure_seq.h>
 
 #include <linux/inet.h>
 #include <linux/ipv6.h>
@@ -85,14 +84,13 @@
 
 int sysctl_tcp_tw_reuse __read_mostly;
 int sysctl_tcp_low_latency __read_mostly;
-EXPORT_SYMBOL(sysctl_tcp_low_latency);
 
 
 #ifdef CONFIG_TCP_MD5SIG
 static struct tcp_md5sig_key *tcp_v4_md5_do_lookup(struct sock *sk,
 						   __be32 addr);
 static int tcp_v4_md5_hash_hdr(char *md5_hash, struct tcp_md5sig_key *key,
-			       __be32 daddr, __be32 saddr, const struct tcphdr *th);
+			       __be32 daddr, __be32 saddr, struct tcphdr *th);
 #else
 static inline
 struct tcp_md5sig_key *tcp_v4_md5_do_lookup(struct sock *sk, __be32 addr)
@@ -101,10 +99,10 @@ struct tcp_md5sig_key *tcp_v4_md5_do_lookup(struct sock *sk, __be32 addr)
 }
 #endif
 
-struct inet_hashinfo tcp_hashinfo;
-EXPORT_SYMBOL(tcp_hashinfo);
+//存放在tcp_prot的h.hashinfo中  //该变量初始化赋值在tcp_init
+struct inet_hashinfo tcp_hashinfo;//tcp_prot套接口和IPV6的tcpv6_prot在这个hash表中，tcp套接字的struct sock通过inet_hash加入到该hash中 
 
-static inline __u32 tcp_v4_init_sequence(const struct sk_buff *skb)
+static inline __u32 tcp_v4_init_sequence(struct sk_buff *skb)
 {
 	return secure_tcp_sequence_number(ip_hdr(skb)->daddr,
 					  ip_hdr(skb)->saddr,
@@ -142,20 +140,26 @@ int tcp_twsk_unique(struct sock *sk, struct sock *sktw, void *twp)
 
 	return 0;
 }
+
 EXPORT_SYMBOL_GPL(tcp_twsk_unique);
 
 /* This will initiate an outgoing connection. */
+/*
+ * 在套接字层检测完必要条件，如套接字的状态等之后，传输
+ * 接口层中还需对传输控制块进行更详细的校验，如地址族的
+ * 类型，是否获取到有效的路由入口。通过检测后设置传输控
+ * 制块各字段值，如初始化时间戳，保存目的地址和目的端口
+ * 等，最后构造并发送SYN段。
+ */
 int tcp_v4_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)
 {
-	struct sockaddr_in *usin = (struct sockaddr_in *)uaddr;
 	struct inet_sock *inet = inet_sk(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
-	__be16 orig_sport, orig_dport;
-	__be32 daddr, nexthop;
-	struct flowi4 *fl4;
+	struct sockaddr_in *usin = (struct sockaddr_in *)uaddr;
 	struct rtable *rt;
+	__be32 daddr, nexthop;
+	int tmp;
 	int err;
-	struct ip_options_rcu *inet_opt;
 
 	if (addr_len < sizeof(struct sockaddr_in))
 		return -EINVAL;
@@ -163,41 +167,44 @@ int tcp_v4_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)
 	if (usin->sin_family != AF_INET)
 		return -EAFNOSUPPORT;
 
-	nexthop = daddr = usin->sin_addr.s_addr;
-	inet_opt = rcu_dereference_protected(inet->inet_opt,
-					     sock_owned_by_user(sk));
-	if (inet_opt && inet_opt->opt.srr) {
+	nexthop = daddr = usin->sin_addr.s_addr;//connect的时候s_addr里面对应的是目的地址，即对端ip地址
+	if (inet->opt && inet->opt->srr) {
 		if (!daddr)
 			return -EINVAL;
-		nexthop = inet_opt->opt.faddr;
+		nexthop = inet->opt->faddr;
 	}
 
-	orig_sport = inet->inet_sport;
-	orig_dport = usin->sin_port;
-	fl4 = &inet->cork.fl.u.ip4;
-	rt = ip_route_connect(fl4, nexthop, inet->inet_saddr,
-			      RT_CONN_FLAGS(sk), sk->sk_bound_dev_if,
-			      IPPROTO_TCP,
-			      orig_sport, orig_dport, sk, true);
-	if (IS_ERR(rt)) {
-		err = PTR_ERR(rt);
-		if (err == -ENETUNREACH)
+    /*
+	 * 调用ip_route_connect()根据下一跳地址等信息查找目的路由缓存项，如果路由查找命中，则生成一个相应的路由缓存项，这个缓存项不但
+	 * 可以用于当前待发送SYN段，而且对后续的所有数据包都可以起到一个加速路由查找的作用。
+	 */
+	tmp = ip_route_connect(&rt, nexthop, inet->inet_saddr,
+			       RT_CONN_FLAGS(sk), sk->sk_bound_dev_if,
+			       IPPROTO_TCP,
+			       inet->inet_sport, usin->sin_port, sk, 1);
+	if (tmp < 0) {
+		if (tmp == -ENETUNREACH)
 			IP_INC_STATS_BH(sock_net(sk), IPSTATS_MIB_OUTNOROUTES);
-		return err;
+		return tmp;
 	}
 
+    /*TCP不能使用类型为组播或多播的路由缓存项。*/
 	if (rt->rt_flags & (RTCF_MULTICAST | RTCF_BROADCAST)) {
 		ip_rt_put(rt);
 		return -ENETUNREACH;
 	}
 
-	if (!inet_opt || !inet_opt->opt.srr)
-		daddr = fl4->daddr;
+    /* 如果没有启用源路由选项，则使用获取到路由缓存项中的目的地址。*/
+	if (!inet->opt || !inet->opt->srr)
+		daddr = rt->rt_dst;
 
+    /* 如果还未设置传输控制块中的源地址，则使用路由缓存项中的源地址对其进行设置。*/
+    //这里说明了客户端在连接的时候可以不用指明本地IP地址，由路由缓存找到对应目的IP的时候，就可以确定本地IP地址了。
 	if (!inet->inet_saddr)
-		inet->inet_saddr = fl4->saddr;
+		inet->inet_saddr = rt->rt_src;
 	inet->inet_rcv_saddr = inet->inet_saddr;
 
+    /* 如果传输控制块中的时间戳和目的地址已被使用过，则说明该传输控制块之前已建立连接并进行过通信，需重新初始化相关成员。 */
 	if (tp->rx_opt.ts_recent_stamp && inet->inet_daddr != daddr) {
 		/* Reset inherited state */
 		tp->rx_opt.ts_recent	   = 0;
@@ -205,21 +212,20 @@ int tcp_v4_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)
 		tp->write_seq		   = 0;
 	}
 
+    /* 如果启用了sysctl_tw_recycle并接收过时间戳选项，从对端信息块中获取相应的值来初始化ts_recent_stamp和ts_recent。*/
 	if (tcp_death_row.sysctl_tw_recycle &&
-	    !tp->rx_opt.ts_recent_stamp && fl4->daddr == daddr) {
-		struct inet_peer *peer = rt_get_peer(rt, fl4->daddr);
+	    !tp->rx_opt.ts_recent_stamp && rt->rt_dst == daddr) {
+		struct inet_peer *peer = rt_get_peer(rt);
 		/*
 		 * VJ's idea. We save last timestamp seen from
 		 * the destination in peer table, when entering state
 		 * TIME-WAIT * and initialize rx_opt.ts_recent from it,
 		 * when trying new connection.
 		 */
-		if (peer) {
-			inet_peer_refcheck(peer);
-			if ((u32)get_seconds() - peer->tcp_ts_stamp <= TCP_PAWS_MSL) {
-				tp->rx_opt.ts_recent_stamp = peer->tcp_ts_stamp;
-				tp->rx_opt.ts_recent = peer->tcp_ts;
-			}
+		if (peer != NULL &&
+		    (u32)get_seconds() - peer->tcp_ts_stamp <= TCP_PAWS_MSL) {
+			tp->rx_opt.ts_recent_stamp = peer->tcp_ts_stamp;
+			tp->rx_opt.ts_recent = peer->tcp_ts;
 		}
 	}
 
@@ -227,8 +233,8 @@ int tcp_v4_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)
 	inet->inet_daddr = daddr;
 
 	inet_csk(sk)->icsk_ext_hdr_len = 0;
-	if (inet_opt)
-		inet_csk(sk)->icsk_ext_hdr_len = inet_opt->opt.optlen;
+	if (inet->opt)
+		inet_csk(sk)->icsk_ext_hdr_len = inet->opt->optlen;
 
 	tp->rx_opt.mss_clamp = TCP_MSS_DEFAULT;
 
@@ -237,22 +243,33 @@ int tcp_v4_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)
 	 * lock select source port, enter ourselves into the hash tables and
 	 * complete initialization after this.
 	 */
+	 /* 将TCP设置为SYN_SENT，动态绑定一个本地端口，并将传输控制块添加到ehash散列表中。由于在动态分配端口时，如果找到的是已使用的端口，则
+	 * 需在TIME_WAIT状态中进行相应的确认，因此调用inet_hash_connect()时需用timewait传输控制块和参数管理器tcp_death_row作为参数。*/
 	tcp_set_state(sk, TCP_SYN_SENT);
 	err = inet_hash_connect(&tcp_death_row, sk);
 	if (err)
 		goto failure;
 
-	rt = ip_route_newports(fl4, rt, orig_sport, orig_dport,
-			       inet->inet_sport, inet->inet_dport, sk);
-	if (IS_ERR(rt)) {
-		err = PTR_ERR(rt);
-		rt = NULL;
+	err = ip_route_newports(&rt, IPPROTO_TCP,
+				inet->inet_sport, inet->inet_dport, sk);
+	if (err)
 		goto failure;
-	}
-	/* OK, now commit destination to socket.  */
-	sk->sk_gso_type = SKB_GSO_TCPV4;
-	sk_setup_caps(sk, &rt->dst);
 
+	/* OK, now commit destination to socket.  */
+	/*
+	 * 设置GSO类型为SKB_GSO_TCPV4，并根据该传输
+	 * 控制块的路由输出设置特性设置传输控制
+	 * 块中目的路由网络设备的特性。
+	 */
+	sk->sk_gso_type = SKB_GSO_TCPV4;
+	sk_setup_caps(sk, &rt->u.dst);
+
+    /*
+	 * 如果write_seq字段值为零，则说明该传输控制块还
+	 * 未设置初始序号，因此需调用secure_tcp_sequence_number()，
+	 * 根据双方的地址、端口计算初始序列号，同时根据
+	 * 发送需要和当前时间得到用于设置IP首部ID域的值。
+	 */
 	if (!tp->write_seq)
 		tp->write_seq = secure_tcp_sequence_number(inet->inet_saddr,
 							   inet->inet_daddr,
@@ -261,6 +278,9 @@ int tcp_v4_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)
 
 	inet->inet_id = tp->write_seq ^ jiffies;
 
+    /*
+	 * 最后调用tcp_connect()来构造并发送SYN段。
+	 */
 	err = tcp_connect(sk);
 	rt = NULL;
 	if (err)
@@ -279,12 +299,82 @@ failure:
 	inet->inet_dport = 0;
 	return err;
 }
-EXPORT_SYMBOL(tcp_v4_connect);
 
 /*
  * This routine does path mtu discovery as defined in RFC1191.
  */
-static void do_pmtu_discovery(struct sock *sk, const struct iphdr *iph, u32 mtu)
+/*
+ * ICMP模块接收到"需要分片ICMP目的不可达报文"的消息后，
+ * 根据传输层协议，如果是TCP，则会调用tcp_v4_err()，在该
+ * 函数中进而根据类型ICMP_DEST_UNREACH和编码ICMP_FRAG_NEEDED
+ * 调用do_pmtu_discovery()进行路径MTU发现失败处理。
+ */
+static void do_pmtu_discovery(struct sock *sk, struct iphdr *iph, u32 mtu)
+{
+    struct dst_entry *dst;
+    struct inet_sock *inet = inet_sk(sk);
+
+    /* We are not interested in TCP_LISTEN and open_requests (SYN-ACKs
+     * send out by Linux are always <576bytes so they should go through
+     * unfragmented).
+     */
+    /*
+     * 在监听状态下，不需要进行路径MTU发现，因为在该
+     * 状态下输出的SYN+ACK段总是小于536B，因此输出的IP
+     * 数据包不会被分片。
+     */
+    if (sk->sk_state == TCP_LISTEN)
+        return;
+
+    /* We don't check in the destentry if pmtu discovery is forbidden
+     * on this route. We just assume that no packet_to_big packets
+     * are send back when pmtu discovery is not active.
+     * There is a small race when the user changes this flag in the
+     * route, but I think that's acceptable.
+     */
+    /*
+     * 检测当前传输控制块的路由缓存项是否可用。如果
+     * 失效，则不继续处理。
+     */
+    if ((dst = __sk_dst_check(sk, 0)) == NULL)
+        return;
+
+    /*
+     * 在没有锁定路由缓存项的度量值的情况下，将获取的
+     * 下一跳MTU更新到与路由相关的路由缓存项的度量值中。
+     * 如果存储在路由缓存项的度量值中的PTMU大于下一跳的
+     * MTU，且发送出的IP数据包禁止分片，则需报告相应的
+     * 错误。
+     */
+    dst->ops->update_pmtu(dst, mtu);
+
+    /* Something is about to be wrong... Remember soft error
+     * for the case, if this connection will not able to recover.
+     */
+    if (mtu < dst_mtu(dst) && ip_dont_fragment(sk, dst))
+        sk->sk_err_soft = EMSGSIZE;
+
+    mtu = dst_mtu(dst);
+
+    /*
+     * 在允许路径MTU发现的情况下，如果缓存在传输控制块
+     * 中的路径MTU值大于新的值，则需将新的路径MTU值更新
+     * 到传输控制块的缓存中，同时更新MSS，最后重传。
+     */
+    if (inet->pmtudisc != IP_PMTUDISC_DONT &&
+        inet_csk(sk)->icsk_pmtu_cookie > mtu) {
+        tcp_sync_mss(sk, mtu);
+
+        /* Resend the TCP packet because it's
+         * clear that the old packet has been
+         * dropped. This is the new "fast" path mtu
+         * discovery.
+         */
+        tcp_simple_retransmit(sk);
+    } /* else let the usual retransmit timer handle it */
+}
+
+static void do_pmtu_discovery1(struct sock *sk, struct iphdr *iph, u32 mtu)
 {
 	struct dst_entry *dst;
 	struct inet_sock *inet = inet_sk(sk);
@@ -343,10 +433,18 @@ static void do_pmtu_discovery(struct sock *sk, const struct iphdr *iph, u32 mtu)
  * is probably better.
  *
  */
-
+    /*
+     * 目的不可达、源端被关闭、超时、参数错误这四种类型
+     * 的差错ICMP报文，都是由同一个函数icmp_unreach()来处理的，
+     * 对其中目的不可达、源端被关闭这两种类型ICMP报文
+     * 因要提取某些信息而需作一些特殊的处理，而另外
+     * 一些则不需要，根据差错报文中的信息直接调用
+     * 传输层的错误处理例程。参见<Linux内核源码剖析348页>
+     CMP差错报文的数据部分包括:原始数据报的IP首部再加上前8个字节的数据部分(2字节源端口+2字节目的端口+4字节序号)
+     */
 void tcp_v4_err(struct sk_buff *icmp_skb, u32 info)
 {
-	const struct iphdr *iph = (const struct iphdr *)icmp_skb->data;
+	struct iphdr *iph = (struct iphdr *)icmp_skb->data;
 	struct tcphdr *th = (struct tcphdr *)(icmp_skb->data + (iph->ihl << 2));
 	struct inet_connection_sock *icsk;
 	struct tcp_sock *tp;
@@ -360,11 +458,22 @@ void tcp_v4_err(struct sk_buff *icmp_skb, u32 info)
 	int err;
 	struct net *net = dev_net(icmp_skb->dev);
 
+    /*
+	 * 检测ICMP报文长度是否包含了原始IP首部和原始IP数据包中
+	 * 前8字节数据，如果不完整则返回
+	 */
 	if (icmp_skb->len < (iph->ihl << 2) + 8) {
 		ICMP_INC_STATS_BH(net, ICMP_MIB_INERRORS);
 		return;
 	}
 
+    /*
+	 * 通过从ICMP报文数据中获取的原始TCP首部中源端口号和IP首部
+	 * 中源地址，得到发送该TCP报文的传输控制块。如果获取失败，
+	 * 则说明ICMP报文有误或该套接字已关闭；如果获取传输控制块
+	 * 的TCP状态为TIME_WAIT，则说明套接字即将关闭，这两种情况
+	 * 都无需进一步处理
+	 */
 	sk = inet_lookup(net, &tcp_hashinfo, iph->daddr, th->dest,
 			iph->saddr, th->source, inet_iif(icmp_skb));
 	if (!sk) {
@@ -379,6 +488,9 @@ void tcp_v4_err(struct sk_buff *icmp_skb, u32 info)
 	bh_lock_sock(sk);
 	/* If too many ICMPs get dropped on busy
 	 * servers this needs to be solved differently.
+	 *//*
+	 * 如果此时该传输控制块被用户进程锁定(如用户进程正在调用
+	 * send等系统调用)，则需累计相关SNMP的统计量
 	 */
 	if (sock_owned_by_user(sk))
 		NET_INC_STATS_BH(net, LINUX_MIB_LOCKDROPPEDICMPS);
@@ -390,6 +502,11 @@ void tcp_v4_err(struct sk_buff *icmp_skb, u32 info)
 		NET_INC_STATS_BH(net, LINUX_MIB_TCPMINTTLDROP);
 		goto out;
 	}
+
+    /*
+         * 如果传输控制块不再侦听状态，且序号不再已发送未确认的区间内，则
+         * ICMP报文异常，无需进一步处理
+         */
 
 	icsk = inet_csk(sk);
 	tp = tcp_sk(sk);
@@ -407,6 +524,12 @@ void tcp_v4_err(struct sk_buff *icmp_skb, u32 info)
 	case ICMP_PARAMETERPROB:
 		err = EPROTO;
 		break;
+		/*
+	 * 处理目的不可达类型，首先检测代码的合法性，然后根据
+	 * 代码具体处理:如果需要分片而设置了不可分片，则调用
+	 * do_pmtu_discovery()探测路径MTU；其他编码，则获取
+	 * 对应的错误码
+	 */
 	case ICMP_DEST_UNREACH:
 		if (code > NR_ICMP_UNREACH)
 			goto out;
@@ -430,8 +553,8 @@ void tcp_v4_err(struct sk_buff *icmp_skb, u32 info)
 			break;
 
 		icsk->icsk_backoff--;
-		inet_csk(sk)->icsk_rto = (tp->srtt ? __tcp_set_rto(tp) :
-			TCP_TIMEOUT_INIT) << icsk->icsk_backoff;
+		inet_csk(sk)->icsk_rto = __tcp_set_rto(tp) <<
+					 icsk->icsk_backoff;
 		tcp_bound_rto(sk);
 
 		skb = tcp_write_queue_head(sk);
@@ -460,9 +583,16 @@ void tcp_v4_err(struct sk_buff *icmp_skb, u32 info)
 	switch (sk->sk_state) {
 		struct request_sock *req, **prev;
 	case TCP_LISTEN:
+	    /*
+		 * 如果传输控制块被用户进程锁定，则不作进一步处理
+		 */
 		if (sock_owned_by_user(sk))
 			goto out;
 
+        /*
+		 * 由于处于监听状态，因此根据目的端口号、源地址和目的地址查找
+		 * 正在连接的对端套接字，如果查找失败则不作进一步处理
+		 */
 		req = inet_csk_search_req(sk, &prev, th->dest,
 					  iph->daddr, iph->saddr);
 		if (!req)
@@ -473,6 +603,10 @@ void tcp_v4_err(struct sk_buff *icmp_skb, u32 info)
 		 */
 		WARN_ON(req->sk);
 
+        /*
+		 * 如果发送出去TCP段的序号不等于对端套接字中的发送序号，
+		 * 则说明序号有误，不作进一步处理
+		 */
 		if (seq != tcp_rsk(req)->snt_isn) {
 			NET_INC_STATS_BH(net, LINUX_MIB_OUTOFWINDOWICMPS);
 			goto out;
@@ -484,13 +618,21 @@ void tcp_v4_err(struct sk_buff *icmp_skb, u32 info)
 		 * created socket, and POSIX does not want network
 		 * errors returned from accept().
 		 */
+		 /*
+		 * 删除并释放连接过程中的传输控制块
+		 */
 		inet_csk_reqsk_queue_drop(sk, req, prev);
 		goto out;
 
 	case TCP_SYN_SENT:
 	case TCP_SYN_RECV:  /* Cannot happen.
 			       It can f.e. if SYNs crossed.
-			     */
+			     *//*
+		 * 如果传输控制块没有被用户进程锁定，则将错误码设置到sk_err，
+		 * 调用该套接字的错误报告借口函数，关闭套接字；否则将错误码
+		 * 设置到sk_err_soft，在这种情况下用户进程可使用SO_ERROR套接
+		 * 字选项获取错误码
+		 */
 		if (!sock_owned_by_user(sk)) {
 			sk->sk_err = err;
 
@@ -519,6 +661,11 @@ void tcp_v4_err(struct sk_buff *icmp_skb, u32 info)
 	 *							--ANK (980905)
 	 */
 
+    /*
+	 * 到这一步，则传输控制块一定不再LISTEN、SYN_SENT或SYN_RECV状态，
+	 * 此时如果控制块没有被用户进程锁定，并且允许接收扩展的可靠错误
+	 * 信息，则设置得到的错误码，然后通知错误；否则将错误码设置到sk_err_soft
+	 */
 	inet = inet_sk(sk);
 	if (!sock_owned_by_user(sk) && inet->recverr) {
 		sk->sk_err = err;
@@ -532,16 +679,26 @@ out:
 	sock_put(sk);
 }
 
+/*
+ * 基于TCP用户数据的中间累加和(如果存在数据)，生成TCP包的校验和
+ */ //这是TCP输出的时候的校验和tcp_v4_send_check, TCP输入的时候计算校验和用的tcp_v4_checksum_init
 static void __tcp_v4_send_check(struct sk_buff *skb,
 				__be32 saddr, __be32 daddr)
 {
 	struct tcphdr *th = tcp_hdr(skb);
 
+    /*
+	 * 如果TCP包本身的校验由硬件来完成，则只执行伪首部校验和
+	 */
 	if (skb->ip_summed == CHECKSUM_PARTIAL) {
 		th->check = ~tcp_v4_check(skb->len, saddr, daddr, 0);
 		skb->csum_start = skb_transport_header(skb) - skb->head;
 		skb->csum_offset = offsetof(struct tcphdr, check);
 	} else {
+	    /*
+		 * 对于用软件完成校验和的操作，则基于TCP用户数据的中间累加和，
+		 * 生成TCP包的校验和
+		 */
 		th->check = tcp_v4_check(skb->len, saddr, daddr,
 					 csum_partial(th,
 						      th->doff << 2,
@@ -550,13 +707,15 @@ static void __tcp_v4_send_check(struct sk_buff *skb,
 }
 
 /* This routine computes an IPv4 TCP checksum. */
+/*
+ * 基于TCP用户数据的中间累加和(如果存在数据)，生成TCP包的校验和
+ *///这是TCP输出的时候的校验和tcp_v4_send_check, TCP输入的时候计算校验和用的tcp_v4_checksum_init
 void tcp_v4_send_check(struct sock *sk, struct sk_buff *skb)
 {
-	const struct inet_sock *inet = inet_sk(sk);
+	struct inet_sock *inet = inet_sk(sk);
 
 	__tcp_v4_send_check(skb, inet->inet_saddr, inet->inet_daddr);
 }
-EXPORT_SYMBOL(tcp_v4_send_check);
 
 int tcp_v4_gso_send_check(struct sk_buff *skb)
 {
@@ -590,7 +749,7 @@ int tcp_v4_gso_send_check(struct sk_buff *skb)
 
 static void tcp_v4_send_reset(struct sock *sk, struct sk_buff *skb)
 {
-	const struct tcphdr *th = tcp_hdr(skb);
+	struct tcphdr *th = tcp_hdr(skb);
 	struct {
 		struct tcphdr th;
 #ifdef CONFIG_TCP_MD5SIG
@@ -652,8 +811,7 @@ static void tcp_v4_send_reset(struct sock *sk, struct sk_buff *skb)
 	arg.flags = (sk && inet_sk(sk)->transparent) ? IP_REPLY_ARG_NOSRCCHECK : 0;
 
 	net = dev_net(skb_dst(skb)->dev);
-	arg.tos = ip_hdr(skb)->tos;
-	ip_send_reply(net->ipv4.tcp_sock, skb, ip_hdr(skb)->saddr,
+	ip_send_reply(net->ipv4.tcp_sock, skb,
 		      &arg, arg.iov[0].iov_len);
 
 	TCP_INC_STATS_BH(net, TCP_MIB_OUTSEGS);
@@ -667,9 +825,9 @@ static void tcp_v4_send_reset(struct sock *sk, struct sk_buff *skb)
 static void tcp_v4_send_ack(struct sk_buff *skb, u32 seq, u32 ack,
 			    u32 win, u32 ts, int oif,
 			    struct tcp_md5sig_key *key,
-			    int reply_flags, u8 tos)
+			    int reply_flags)
 {
-	const struct tcphdr *th = tcp_hdr(skb);
+	struct tcphdr *th = tcp_hdr(skb);
 	struct {
 		struct tcphdr th;
 		__be32 opt[(TCPOLEN_TSTAMP_ALIGNED >> 2)
@@ -727,8 +885,8 @@ static void tcp_v4_send_ack(struct sk_buff *skb, u32 seq, u32 ack,
 	arg.csumoffset = offsetof(struct tcphdr, check) / 2;
 	if (oif)
 		arg.bound_dev_if = oif;
-	arg.tos = tos;
-	ip_send_reply(net->ipv4.tcp_sock, skb, ip_hdr(skb)->saddr,
+
+	ip_send_reply(net->ipv4.tcp_sock, skb,
 		      &arg, arg.iov[0].iov_len);
 
 	TCP_INC_STATS_BH(net, TCP_MIB_OUTSEGS);
@@ -744,8 +902,7 @@ static void tcp_v4_timewait_ack(struct sock *sk, struct sk_buff *skb)
 			tcptw->tw_ts_recent,
 			tw->tw_bound_dev_if,
 			tcp_twsk_md5_key(tcptw),
-			tw->tw_transparent ? IP_REPLY_ARG_NOSRCCHECK : 0,
-			tw->tw_tos
+			tw->tw_transparent ? IP_REPLY_ARG_NOSRCCHECK : 0
 			);
 
 	inet_twsk_put(tw);
@@ -759,8 +916,7 @@ static void tcp_v4_reqsk_send_ack(struct sock *sk, struct sk_buff *skb,
 			req->ts_recent,
 			0,
 			tcp_v4_md5_do_lookup(sk, ip_hdr(skb)->daddr),
-			inet_rsk(req)->no_srccheck ? IP_REPLY_ARG_NOSRCCHECK : 0,
-			ip_hdr(skb)->tos);
+			inet_rsk(req)->no_srccheck ? IP_REPLY_ARG_NOSRCCHECK : 0);
 }
 
 /*
@@ -773,12 +929,11 @@ static int tcp_v4_send_synack(struct sock *sk, struct dst_entry *dst,
 			      struct request_values *rvp)
 {
 	const struct inet_request_sock *ireq = inet_rsk(req);
-	struct flowi4 fl4;
 	int err = -1;
 	struct sk_buff * skb;
 
 	/* First, grab a route. */
-	if (!dst && (dst = inet_csk_route_req(sk, &fl4, req)) == NULL)
+	if (!dst && (dst = inet_csk_route_req(sk, req)) == NULL)
 		return -1;
 
 	skb = tcp_make_synack(sk, dst, req, rvp);
@@ -811,54 +966,34 @@ static void tcp_v4_reqsk_destructor(struct request_sock *req)
 	kfree(inet_rsk(req)->opt);
 }
 
-/*
- * Return 1 if a syncookie should be sent
- */
-int tcp_syn_flood_action(struct sock *sk,
-			 const struct sk_buff *skb,
-			 const char *proto)
-{
-	const char *msg = "Dropping request";
-	int want_cookie = 0;
-	struct listen_sock *lopt;
-
-
-
 #ifdef CONFIG_SYN_COOKIES
-	if (sysctl_tcp_syncookies) {
-		msg = "Sending cookies";
-		want_cookie = 1;
-		NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_TCPREQQFULLDOCOOKIES);
-	} else
-#endif
-		NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_TCPREQQFULLDROP);
+static void syn_flood_warning(struct sk_buff *skb)
+{
+	static unsigned long warntime;
 
-	lopt = inet_csk(sk)->icsk_accept_queue.listen_opt;
-	if (!lopt->synflood_warned) {
-		lopt->synflood_warned = 1;
-		pr_info("%s: Possible SYN flooding on port %d. %s. "
-			" Check SNMP counters.\n",
-			proto, ntohs(tcp_hdr(skb)->dest), msg);
+	if (time_after(jiffies, (warntime + HZ * 60))) {
+		warntime = jiffies;
+		printk(KERN_INFO
+		       "possible SYN flooding on port %d. Sending cookies.\n",
+		       ntohs(tcp_hdr(skb)->dest));
 	}
-	return want_cookie;
 }
-EXPORT_SYMBOL(tcp_syn_flood_action);
+#endif
 
 /*
  * Save and compile IPv4 options into the request_sock if needed.
  */
-static struct ip_options_rcu *tcp_v4_save_options(struct sock *sk,
-						  struct sk_buff *skb)
+static struct ip_options *tcp_v4_save_options(struct sock *sk,
+					      struct sk_buff *skb)
 {
-	const struct ip_options *opt = &(IPCB(skb)->opt);
-	struct ip_options_rcu *dopt = NULL;
+	struct ip_options *opt = &(IPCB(skb)->opt);
+	struct ip_options *dopt = NULL;
 
 	if (opt && opt->optlen) {
-		int opt_size = sizeof(*dopt) + opt->optlen;
-
+		int opt_size = optlength(opt);
 		dopt = kmalloc(opt_size, GFP_ATOMIC);
 		if (dopt) {
-			if (ip_options_echo(&dopt->opt, skb)) {
+			if (ip_options_echo(dopt, skb)) {
 				kfree(dopt);
 				dopt = NULL;
 			}
@@ -895,6 +1030,7 @@ struct tcp_md5sig_key *tcp_v4_md5_lookup(struct sock *sk,
 {
 	return tcp_v4_md5_do_lookup(sk, inet_sk(addr_sk)->inet_daddr);
 }
+
 EXPORT_SYMBOL(tcp_v4_md5_lookup);
 
 static struct tcp_md5sig_key *tcp_v4_reqsk_md5_lookup(struct sock *sk,
@@ -930,21 +1066,18 @@ int tcp_v4_md5_do_add(struct sock *sk, __be32 addr,
 			}
 			sk_nocaps_add(sk, NETIF_F_GSO_MASK);
 		}
-
-		md5sig = tp->md5sig_info;
-		if (md5sig->entries4 == 0 &&
-		    tcp_alloc_md5sig_pool(sk) == NULL) {
+		if (tcp_alloc_md5sig_pool(sk) == NULL) {
 			kfree(newkey);
 			return -ENOMEM;
 		}
+		md5sig = tp->md5sig_info;
 
 		if (md5sig->alloced4 == md5sig->entries4) {
 			keys = kmalloc((sizeof(*keys) *
 					(md5sig->entries4 + 1)), GFP_ATOMIC);
 			if (!keys) {
 				kfree(newkey);
-				if (md5sig->entries4 == 0)
-					tcp_free_md5sig_pool();
+				tcp_free_md5sig_pool();
 				return -ENOMEM;
 			}
 
@@ -964,6 +1097,7 @@ int tcp_v4_md5_do_add(struct sock *sk, __be32 addr,
 	}
 	return 0;
 }
+
 EXPORT_SYMBOL(tcp_v4_md5_do_add);
 
 static int tcp_v4_md5_add_func(struct sock *sk, struct sock *addr_sk,
@@ -988,7 +1122,6 @@ int tcp_v4_md5_do_del(struct sock *sk, __be32 addr)
 				kfree(tp->md5sig_info->keys4);
 				tp->md5sig_info->keys4 = NULL;
 				tp->md5sig_info->alloced4 = 0;
-				tcp_free_md5sig_pool();
 			} else if (tp->md5sig_info->entries4 != i) {
 				/* Need to do some manipulation */
 				memmove(&tp->md5sig_info->keys4[i],
@@ -996,11 +1129,13 @@ int tcp_v4_md5_do_del(struct sock *sk, __be32 addr)
 					(tp->md5sig_info->entries4 - i) *
 					 sizeof(struct tcp4_md5sig_key));
 			}
+			tcp_free_md5sig_pool();
 			return 0;
 		}
 	}
 	return -ENOENT;
 }
+
 EXPORT_SYMBOL(tcp_v4_md5_do_del);
 
 static void tcp_v4_clear_md5_list(struct sock *sk)
@@ -1093,7 +1228,7 @@ static int tcp_v4_md5_hash_pseudoheader(struct tcp_md5sig_pool *hp,
 }
 
 static int tcp_v4_md5_hash_hdr(char *md5_hash, struct tcp_md5sig_key *key,
-			       __be32 daddr, __be32 saddr, const struct tcphdr *th)
+			       __be32 daddr, __be32 saddr, struct tcphdr *th)
 {
 	struct tcp_md5sig_pool *hp;
 	struct hash_desc *desc;
@@ -1125,12 +1260,12 @@ clear_hash_noput:
 }
 
 int tcp_v4_md5_hash_skb(char *md5_hash, struct tcp_md5sig_key *key,
-			const struct sock *sk, const struct request_sock *req,
-			const struct sk_buff *skb)
+			struct sock *sk, struct request_sock *req,
+			struct sk_buff *skb)
 {
 	struct tcp_md5sig_pool *hp;
 	struct hash_desc *desc;
-	const struct tcphdr *th = tcp_hdr(skb);
+	struct tcphdr *th = tcp_hdr(skb);
 	__be32 saddr, daddr;
 
 	if (sk) {
@@ -1173,9 +1308,10 @@ clear_hash_noput:
 	memset(md5_hash, 0, 16);
 	return 1;
 }
+
 EXPORT_SYMBOL(tcp_v4_md5_hash_skb);
 
-static int tcp_v4_inbound_md5_hash(struct sock *sk, const struct sk_buff *skb)
+static int tcp_v4_inbound_md5_hash(struct sock *sk, struct sk_buff *skb)
 {
 	/*
 	 * This gets called for each TCP segment that arrives
@@ -1185,10 +1321,10 @@ static int tcp_v4_inbound_md5_hash(struct sock *sk, const struct sk_buff *skb)
 	 * o MD5 hash and we're not expecting one.
 	 * o MD5 hash and its wrong.
 	 */
-	const __u8 *hash_location = NULL;
+	__u8 *hash_location = NULL;
 	struct tcp_md5sig_key *hash_expected;
 	const struct iphdr *iph = ip_hdr(skb);
-	const struct tcphdr *th = tcp_hdr(skb);
+	struct tcphdr *th = tcp_hdr(skb);
 	int genhash;
 	unsigned char newhash[16];
 
@@ -1230,7 +1366,7 @@ static int tcp_v4_inbound_md5_hash(struct sock *sk, const struct sk_buff *skb)
 
 #endif
 
-struct request_sock_ops tcp_request_sock_ops __read_mostly = {
+struct request_sock_ops tcp_request_sock_ops = {
 	.family		=	PF_INET,
 	.obj_size	=	sizeof(struct tcp_request_sock),
 	.rtx_syn_ack	=	tcp_v4_rtx_synack,
@@ -1247,11 +1383,254 @@ static const struct tcp_request_sock_ops tcp_request_sock_ipv4_ops = {
 };
 #endif
 
+static struct timewait_sock_ops tcp_timewait_sock_ops = {
+	.twsk_obj_size	= sizeof(struct tcp_timewait_sock),
+	.twsk_unique	= tcp_twsk_unique,
+	.twsk_destructor= tcp_twsk_destructor,
+};
+
+/*
+ * 服务端用来处理客户端连接请求的函数
+ */
+//服务器端收到SYN后，创建连接控制块request_sock。也就是收到第一步SYN的时候只是建立的连接控制块request_sock，当收到第三次ack的时候，才创建新的struct sock
 int tcp_v4_conn_request(struct sock *sk, struct sk_buff *skb)
+{
+	struct inet_request_sock *ireq;
+	struct tcp_options_received tmp_opt;
+	struct request_sock *req;
+	__be32 saddr = ip_hdr(skb)->saddr;
+	__be32 daddr = ip_hdr(skb)->daddr;
+	__u32 isn = TCP_SKB_CB(skb)->when;
+	struct dst_entry *dst = NULL;
+#ifdef CONFIG_SYN_COOKIES
+	int want_cookie = 0; //如果启用了cookie机制，则会在第三步收到ACK的时候在tcp_v4_hnd_req中的cookie_v4_check对之前发送的ack+syn进行检查，检查过程见cookie_v4_check
+#else
+#define want_cookie 0 /* Argh, why doesn't gcc optimize this :( */
+#endif
+
+	/* Never answer to SYNs send to broadcast or multicast */
+	/*
+	 * 如果SYN段发送到广播地址或组播地址，则直接返回不作处理
+	 */
+	if (skb_rtable(skb)->rt_flags & (RTCF_BROADCAST | RTCF_MULTICAST))
+		goto drop;
+
+	/* TW buckets are converted to open requests without
+	 * limitations, they conserve resources and peer is
+	 * evidently real one.
+	 */
+	/*
+	 * 如果SYN请求连接队列已满并且isn为零，则需做特别处理。
+	 * 这里的isn就是TCP_SKB_CB(skb)->when，而TCP_SKB_CB(skb)->when
+	 * 在TCP接收处理一开始就被清零，因此这里isn为零总是成立
+	 */
+	if (inet_csk_reqsk_queue_is_full(sk) && !isn) {
+#ifdef CONFIG_SYN_COOKIES /* 该宏默认有定义*/
+		/*
+		 * 如果启用了syncookies(CONFIG_SYN_COOKIES有定义)，则设置启用syncookies标志，
+		 * 以便在后续的处理中使用syncookies规则来处理
+		 */
+		if (sysctl_tcp_syncookies) {
+			want_cookie = 1;
+		} else
+#endif
+		/*
+		 * 如果没有启用syncookies，则此时不能再接收新的SYN连接请求，
+		 * 只能丢弃
+		 */
+		goto drop;
+	}
+
+	/* Accept backlog is full. If we have already queued enough
+	 * of warm entries in syn queue, drop request. It is better than
+	 * clogging syn queue with openreqs with exponentially increasing
+	 * timeout.
+	 */
+	/*
+	 * 如果连接队列长度已达到上限且SYN请求队列中至少有一个握手过程中
+	 * 没有重传过的段，则丢弃当前连接请求.
+	 *  如果半连接队列中未重传的请求块数量大于1，
+	 * 则表示未来可能有2个完成的连接，这些新完成
+	 * 的连接要放到连接队列中，但此时连接队列已满
+	 * 。如果在接收到三次握手中最后的ACK后连接队列
+	 * 中没有空闲的位置，会忽略接收到的ACK包，连接
+	 * 建立会推迟，所以此时最好丢掉部分新的连接请
+	 * 求，空出资源以完成正在进行的连接建立过程。
+	 * 还要注意，这个判断并没有考虑半连接队列是否
+	 * 已满的问题。从这里可以看出，即使开启了
+	 * SYN cookies机制并不意味着一定可以完成连接的建立。
+	 * 
+	 */
+	if (sk_acceptq_is_full(sk) && inet_csk_reqsk_queue_young(sk) > 1)
+		goto drop;
+
+	/*
+	 * 可以接收并处理连接请求，调用inet_reqsk_alloc()分配一个连接请求
+	 * 块，用于保存连接请求信息，同时初始化在建立连接过程中用来发送
+	 * ACK、RST段的操作集合，以便在建立连接过程中能方便地调用这些接口
+	 */
+	req = inet_reqsk_alloc(&tcp_request_sock_ops);
+	if (!req)
+		goto drop;
+
+/*
+ * 通过TCP MD5签名来保护BGP会话(RFC2385)操作
+ */
+#ifdef CONFIG_TCP_MD5SIG
+	tcp_rsk(req)->af_specific = &tcp_request_sock_ipv4_ops;
+#endif
+
+	/*
+	 * 清除TCP选项后初始化mss_clamp和user_mss。
+	 */
+	tcp_clear_options(&tmp_opt);
+	tmp_opt.mss_clamp = 536;
+	tmp_opt.user_mss  = tcp_sk(sk)->rx_opt.user_mss;
+
+	/*
+	 * 解析SYN段中的TCP选项
+	 */
+	tcp_parse_options(skb, &tmp_opt, 0);
+
+	/*
+	 * 如果启用了syncookies，并且最近一次接收到的TCP段(即当前的skb)
+	 * 不存在TCP时间戳选项，则清除已解析的TCP选项
+	 */
+	if (want_cookie && !tmp_opt.saw_tstamp)
+		tcp_clear_options(&tmp_opt);
+
+	/*
+	 * 初始化该连接中是否启用时间戳的选项tstamp_ok
+	 */
+	tmp_opt.tstamp_ok = tmp_opt.saw_tstamp;
+
+	/*
+	 * 根据接收到SYN段中的选项和序号来初始化连接请求块信息
+	 */
+	tcp_openreq_init(req, &tmp_opt, skb);
+
+	/*
+	 * 初始化TCP层次的连接请求信息块，包括目的地址、源地址，
+	 * 并调用tcp_v4_save_options从IP层私有控制块中获取IP
+	 * 选项保存到传输控制块的opt中，包括MSS、窗口扩大
+	 * 因子、显式拥塞通知等
+	 */
+	ireq = inet_rsk(req);
+	ireq->loc_addr = daddr;
+	ireq->rmt_addr = saddr;
+	ireq->no_srccheck = inet_sk(sk)->transparent;
+	ireq->opt = tcp_v4_save_options(sk, skb);
+
+	/*
+	 * 如果安全检测失败，则丢弃该SYN段
+	 */
+	if (security_inet_conn_request(sk, skb, req))
+		goto drop_and_free;
+
+	if (!want_cookie)
+		TCP_ECN_create_request(req, tcp_hdr(skb));
+
+	if (want_cookie) {
+		/*
+		 * 如果启动了syncookies，则每60秒警告一次可能受
+		 * synflood攻击，同时由客户端IP地址、客户端端口、
+		 * 服务器IP地址、服务器端口、客户端初始序列号
+		 * 等要素经hash运算后加密得到服务端初始化序列号
+		 */
+#ifdef CONFIG_SYN_COOKIES
+		syn_flood_warning(skb);
+		req->cookie_ts = tmp_opt.tstamp_ok;
+#endif
+		isn = cookie_v4_init_sequence(sk, skb, &req->mss);//如果开启了syncookie选项，则需要检查收到的第三步ack和这个isn值是否一致
+	} else if (!isn) {
+		struct inet_peer *peer = NULL;
+
+		/* VJ's idea. We save last timestamp seen
+		 * from the destination in peer table, when entering
+		 * state TIME-WAIT, and check against it before
+		 * accepting new connection request.
+		 *
+		 * If "isn" is not zero, this request hit alive
+		 * timewait bucket, so that all the necessary checks
+		 * are made in the function processing timewait state.
+		 */
+		/*
+		 * 进入TIMEWAIT状态时，从对端信息块中获取时间戳，在新的
+		 * 连接请求之前检测PAWS
+		 */
+		if (tmp_opt.saw_tstamp &&
+		    tcp_death_row.sysctl_tw_recycle &&
+		    (dst = inet_csk_route_req(sk, req)) != NULL &&
+		    (peer = rt_get_peer((struct rtable *)dst)) != NULL &&
+		    peer->v4daddr == saddr) { //当起了快速回收tw_recycle的时候，这里可能有问题，可能连接建立不上，针对TCP时间戳PAWS漏洞的代码。 见:http://blog.chinaunix.net/uid-736168-id-376061.html
+                //针对TCP时间戳PAWS漏洞，造成服务器端收到SYN的时候不回收SYN+ACK，解决办法是对方不要发送时间戳选项，同时关闭tcp_timestamps见tcp_v4_conn_request
+			if (get_seconds() < peer->tcp_ts_stamp + TCP_PAWS_MSL &&
+			    (s32)(peer->tcp_ts - req->ts_recent) >
+							TCP_PAWS_WINDOW) {
+				NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_PAWSPASSIVEREJECTED);
+				goto drop_and_release;
+			}
+		}
+		/* Kill the following clause, if you dislike this way. */
+		/*
+		 * 未启动syncookies的情况下受到synflood攻击，则丢弃接收到的段
+		 */
+		else if (!sysctl_tcp_syncookies &&
+			 (sysctl_max_syn_backlog - inet_csk_reqsk_queue_len(sk) <
+			  (sysctl_max_syn_backlog >> 2)) &&
+			 (!peer || !peer->tcp_ts_stamp) &&
+			 (!dst || !dst_metric(dst, RTAX_RTT))) {
+			/* Without syncookies last quarter of
+			 * backlog is filled with destinations,
+			 * proven to be alive.
+			 * It means that we continue to communicate
+			 * to destinations, already remembered
+			 * to the moment of synflood.
+			 */
+			LIMIT_NETDEBUG(KERN_DEBUG "TCP: drop open request from %pI4/%u\n",
+				       &saddr, ntohs(tcp_hdr(skb)->source));
+			goto drop_and_release;
+		}
+
+		/*
+		 * 由源地址、源端口号、目的地址以及目的端口计算出服务端
+		 * 初始序列号
+		 */
+		isn = tcp_v4_init_sequence(skb);
+	}
+	/*
+	 * 将计算得到的初始序列号存放到连接请求阶段的传输控制块中
+	 */
+	tcp_rsk(req)->snt_isn = isn;
+
+	/*
+	 * 调用__tcp_v4_send_synack()组织并发送SYN+ACK段给客户端；如果
+	 * 启用了syncookies，则是根据序号来判断三次握手的，因此无需保存
+	 * 连接请求，直接将其释放
+	 */
+	if (tcp_v4_send_synack(sk, req, dst) || want_cookie) //如果是cookie，则真正的tcp_request_sock在第三步ack的时候在cookie_v4_check中创建
+		goto drop_and_free;
+
+	/*
+	 * 将连接请求块保存到其父传输控制块中的散列表中
+	 */
+	inet_csk_reqsk_queue_hash_add(sk, req, TCP_TIMEOUT_INIT);
+	return 0;
+
+drop_and_release:
+	dst_release(dst);
+drop_and_free:
+	reqsk_free(req);
+drop:
+	return 0;
+}
+
+
+int tcp_v4_conn_request1(struct sock *sk, struct sk_buff *skb)
 {
 	struct tcp_extend_values tmp_ext;
 	struct tcp_options_received tmp_opt;
-	const u8 *hash_location;
+	u8 *hash_location;
 	struct request_sock *req;
 	struct inet_request_sock *ireq;
 	struct tcp_sock *tp = tcp_sk(sk);
@@ -1259,7 +1638,11 @@ int tcp_v4_conn_request(struct sock *sk, struct sk_buff *skb)
 	__be32 saddr = ip_hdr(skb)->saddr;
 	__be32 daddr = ip_hdr(skb)->daddr;
 	__u32 isn = TCP_SKB_CB(skb)->when;
+#ifdef CONFIG_SYN_COOKIES
 	int want_cookie = 0;
+#else
+#define want_cookie 0 /* Argh, why doesn't gcc optimize this :( */
+#endif
 
 	/* Never answer to SYNs send to broadcast or multicast */
 	if (skb_rtable(skb)->rt_flags & (RTCF_BROADCAST | RTCF_MULTICAST))
@@ -1270,9 +1653,12 @@ int tcp_v4_conn_request(struct sock *sk, struct sk_buff *skb)
 	 * evidently real one.
 	 */
 	if (inet_csk_reqsk_queue_is_full(sk) && !isn) {
-		want_cookie = tcp_syn_flood_action(sk, skb, "TCP");
-		if (!want_cookie)
-			goto drop;
+#ifdef CONFIG_SYN_COOKIES
+		if (sysctl_tcp_syncookies) {
+			want_cookie = 1;
+		} else
+#endif
+		goto drop;
 	}
 
 	/* Accept backlog is full. If we have already queued enough
@@ -1318,7 +1704,9 @@ int tcp_v4_conn_request(struct sock *sk, struct sk_buff *skb)
 		while (l-- > 0)
 			*c++ ^= *hash_location++;
 
+#ifdef CONFIG_SYN_COOKIES
 		want_cookie = 0;	/* not our kind of cookie */
+#endif
 		tmp_ext.cookie_out_never = 0; /* false */
 		tmp_ext.cookie_plus = tmp_opt.cookie_plus;
 	} else if (!tp->rx_opt.cookie_in_always) {
@@ -1345,15 +1733,17 @@ int tcp_v4_conn_request(struct sock *sk, struct sk_buff *skb)
 	if (security_inet_conn_request(sk, skb, req))
 		goto drop_and_free;
 
-	if (!want_cookie || tmp_opt.tstamp_ok)
+	if (!want_cookie)
 		TCP_ECN_create_request(req, tcp_hdr(skb));
 
 	if (want_cookie) {
-		isn = cookie_v4_init_sequence(sk, skb, &req->mss);
+#ifdef CONFIG_SYN_COOKIES
+		syn_flood_warning(skb);
 		req->cookie_ts = tmp_opt.tstamp_ok;
+#endif
+		isn = cookie_v4_init_sequence(sk, skb, &req->mss);
 	} else if (!isn) {
 		struct inet_peer *peer = NULL;
-		struct flowi4 fl4;
 
 		/* VJ's idea. We save last timestamp seen
 		 * from the destination in peer table, when entering
@@ -1366,10 +1756,9 @@ int tcp_v4_conn_request(struct sock *sk, struct sk_buff *skb)
 		 */
 		if (tmp_opt.saw_tstamp &&
 		    tcp_death_row.sysctl_tw_recycle &&
-		    (dst = inet_csk_route_req(sk, &fl4, req)) != NULL &&
-		    fl4.daddr == saddr &&
-		    (peer = rt_get_peer((struct rtable *)dst, fl4.daddr)) != NULL) {
-			inet_peer_refcheck(peer);
+		    (dst = inet_csk_route_req(sk, req)) != NULL &&
+		    (peer = rt_get_peer((struct rtable *)dst)) != NULL &&
+		    peer->v4daddr == saddr) {
 			if ((u32)get_seconds() - peer->tcp_ts_stamp < TCP_PAWS_MSL &&
 			    (s32)(peer->tcp_ts - req->ts_recent) >
 							TCP_PAWS_WINDOW) {
@@ -1398,7 +1787,6 @@ int tcp_v4_conn_request(struct sock *sk, struct sk_buff *skb)
 		isn = tcp_v4_init_sequence(skb);
 	}
 	tcp_rsk(req)->snt_isn = isn;
-	tcp_rsk(req)->snt_synack = tcp_time_stamp;
 
 	if (tcp_v4_send_synack(sk, dst, req,
 			       (struct request_values *)&tmp_ext) ||
@@ -1415,13 +1803,13 @@ drop_and_free:
 drop:
 	return 0;
 }
-EXPORT_SYMBOL(tcp_v4_conn_request);
 
 
 /*
  * The three way handshake has completed - we got a valid synack -
  * now create the new socket.
  */
+ //收到TCP连接第三步的ACK后，创建一个新的struct sock,也叫'子'sk
 struct sock *tcp_v4_syn_recv_sock(struct sock *sk, struct sk_buff *skb,
 				  struct request_sock *req,
 				  struct dst_entry *dst)
@@ -1433,16 +1821,19 @@ struct sock *tcp_v4_syn_recv_sock(struct sock *sk, struct sk_buff *skb,
 #ifdef CONFIG_TCP_MD5SIG
 	struct tcp_md5sig_key *key;
 #endif
-	struct ip_options_rcu *inet_opt;
 
 	if (sk_acceptq_is_full(sk))
 		goto exit_overflow;
 
+	if (!dst && (dst = inet_csk_route_req(sk, req)) == NULL)
+		goto exit;
+
 	newsk = tcp_create_openreq_child(sk, req, skb);
 	if (!newsk)
-		goto exit_nonewsk;
+		goto exit;
 
 	newsk->sk_gso_type = SKB_GSO_TCPV4;
+	sk_setup_caps(newsk, dst);
 
 	newtp		      = tcp_sk(newsk);
 	newinet		      = inet_sk(newsk);
@@ -1450,33 +1841,23 @@ struct sock *tcp_v4_syn_recv_sock(struct sock *sk, struct sk_buff *skb,
 	newinet->inet_daddr   = ireq->rmt_addr;
 	newinet->inet_rcv_saddr = ireq->loc_addr;
 	newinet->inet_saddr	      = ireq->loc_addr;
-	inet_opt	      = ireq->opt;
-	rcu_assign_pointer(newinet->inet_opt, inet_opt);
+	newinet->opt	      = ireq->opt;
 	ireq->opt	      = NULL;
 	newinet->mc_index     = inet_iif(skb);
 	newinet->mc_ttl	      = ip_hdr(skb)->ttl;
 	inet_csk(newsk)->icsk_ext_hdr_len = 0;
-	if (inet_opt)
-		inet_csk(newsk)->icsk_ext_hdr_len = inet_opt->opt.optlen;
+	if (newinet->opt)
+		inet_csk(newsk)->icsk_ext_hdr_len = newinet->opt->optlen;
 	newinet->inet_id = newtp->write_seq ^ jiffies;
-
-	if (!dst && (dst = inet_csk_route_child_sock(sk, newsk, req)) == NULL)
-		goto put_and_exit;
-
-	sk_setup_caps(newsk, dst);
 
 	tcp_mtup_init(newsk);
 	tcp_sync_mss(newsk, dst_mtu(dst));
-	newtp->advmss = dst_metric_advmss(dst);
+	newtp->advmss = dst_metric(dst, RTAX_ADVMSS);
 	if (tcp_sk(sk)->rx_opt.user_mss &&
 	    tcp_sk(sk)->rx_opt.user_mss < newtp->advmss)
 		newtp->advmss = tcp_sk(sk)->rx_opt.user_mss;
 
 	tcp_initialize_rcv_mss(newsk);
-	if (tcp_rsk(req)->snt_synack)
-		tcp_valid_rtt_meas(newsk,
-		    tcp_time_stamp - tcp_rsk(req)->snt_synack);
-	newtp->total_retrans = req->retrans;
 
 #ifdef CONFIG_TCP_MD5SIG
 	/* Copy over the MD5 key from the original socket */
@@ -1496,27 +1877,27 @@ struct sock *tcp_v4_syn_recv_sock(struct sock *sk, struct sk_buff *skb,
 	}
 #endif
 
-	if (__inet_inherit_port(sk, newsk) < 0)
-		goto put_and_exit;
 	__inet_hash_nolisten(newsk, NULL);
+	__inet_inherit_port(sk, newsk);
 
 	return newsk;
 
 exit_overflow:
 	NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_LISTENOVERFLOWS);
-exit_nonewsk:
-	dst_release(dst);
 exit:
 	NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_LISTENDROPS);
+	dst_release(dst);
 	return NULL;
-put_and_exit:
-	tcp_clear_xmit_timers(newsk);
-	bh_unlock_sock(newsk);
-	sock_put(newsk);
-	goto exit;
 }
-EXPORT_SYMBOL(tcp_v4_syn_recv_sock);
-
+/*
+ * 用来处理作为建立连接三次握手中最后一次握手的ACK段，处理过程如下:
+ *  1. 在请求连接散列表中查找对应的请求连接块。
+ *  2. 如果找到，则根据TCP段标志，ACK或RST或SYN，作相应的处理，
+ *     如果是ACK段则完成连接建立
+ *  3. 如果查找未果，则还需在ehash散列表中查找对应传输控制块，
+ *     并作相应的处理。如果还是查找不到则返回，由tcp_rcv_state_process
+ *     处理
+ */
 static struct sock *tcp_v4_hnd_req(struct sock *sk, struct sk_buff *skb)
 {
 	struct tcphdr *th = tcp_hdr(skb);
@@ -1524,14 +1905,30 @@ static struct sock *tcp_v4_hnd_req(struct sock *sk, struct sk_buff *skb)
 	struct sock *nsk;
 	struct request_sock **prev;
 	/* Find possible connection requests. */
+	/*
+	 * 如果根据源端口、源地址、目的地址在"父"传输控制块的连接请求散列表
+	 * 中查找相应的连接请求块成功，则说明三次握手中的前两次已经完成，
+	 * 接下来进行第三次握手的确认
+	 */
+	//这里面搜索的是inet_connection_sock->icsk_accept_queue中的半连接syn_table hash表
 	struct request_sock *req = inet_csk_search_req(sk, &prev, th->source,
 						       iph->saddr, iph->daddr);
 	if (req)
 		return tcp_check_req(sk, skb, req, prev);
-
+    
+	 /*
+	 * 如果传输控制块不在连接请求散列表中，则有可能在ehash散列表中，
+	 * 因此需要在ehash散列表中查找
+	 */
+    //这里面搜索的是已经三次握手成功的连接控制块
 	nsk = inet_lookup_established(sock_net(sk), &tcp_hashinfo, iph->saddr,
 			th->source, iph->daddr, th->dest, inet_iif(skb));
 
+    /*
+	 * 在ehash散列表中查找成功的情况下，如果该传输控制块不处于
+	 * TIME_WAIT状态，返回该传输控制块；否则说明接收到的段无效，因为连接都已经建立起来了，不应该收到三部握手中的报文
+	 * 返回NULL表示丢弃该段
+	 */
 	if (nsk) {
 		if (nsk->sk_state != TCP_TIME_WAIT) {
 			bh_lock_sock(nsk);
@@ -1542,16 +1939,25 @@ static struct sock *tcp_v4_hnd_req(struct sock *sk, struct sk_buff *skb)
 	}
 
 #ifdef CONFIG_SYN_COOKIES
-	if (!th->syn)
+	if (!th->rst && !th->syn && th->ack)
 		sk = cookie_v4_check(sk, skb, &(IPCB(skb)->opt));
 #endif
 	return sk;
 }
 
+/*
+ * 用于TCP段接收校验的初始化，主要是对伪首部进行校验和的计算。
+ * 当然也有例外，如果校验和由硬件完成，则只对伪首部进行校验
+ * 检测。对于全长不超过76B的TCP包，则直接进行伪首部和全包校验
+ *///这是TCP输出的时候的校验和tcp_v4_send_check, TCP输入的时候计算校验和用的tcp_v4_checksum_init
 static __sum16 tcp_v4_checksum_init(struct sk_buff *skb)
 {
 	const struct iphdr *iph = ip_hdr(skb);
 
+    /*
+	 * 如果TCP包本身的校验已经由硬件完成，则只对伪首部
+	 * 进行校验
+	 */
 	if (skb->ip_summed == CHECKSUM_COMPLETE) {
 		if (!tcp_v4_check(skb->len, iph->saddr,
 				  iph->daddr, skb->csum)) {
@@ -1560,9 +1966,17 @@ static __sum16 tcp_v4_checksum_init(struct sk_buff *skb)
 		}
 	}
 
+    /*
+	 * 对于用软件完成校验和的操作，首先生成伪首部
+	 * 的部分累加和
+	 */ //TCP UDP伪首部校验
 	skb->csum = csum_tcpudp_nofold(iph->saddr, iph->daddr,
 				       skb->len, IPPROTO_TCP, 0);
 
+    /*
+	 * 对于全长不超过76B的TCP包直接进行校验。其他的包，
+	 * 在后续操作中完成全包校验和检测
+	 */
 	if (skb->len <= 76) {
 		return __skb_checksum_complete(skb);
 	}
@@ -1577,6 +1991,11 @@ static __sum16 tcp_v4_checksum_init(struct sk_buff *skb)
  * doing backlog processing we use the BH locking scheme.
  * This is because we cannot sleep with the original spinlock
  * held.
+ *//*
+ * TCP传输层接收到段之后，经过了简单的
+ * 校验，并确定接收处理该段的传输控制
+ * 块之后，除非处于FIN_WAIT_2或TIME_WAIT状态，
+ * 否则都会调用tcp_v4_do_rcv()作具体的处理
  */
 int tcp_v4_do_rcv(struct sock *sk, struct sk_buff *skb)
 {
@@ -1592,38 +2011,42 @@ int tcp_v4_do_rcv(struct sock *sk, struct sk_buff *skb)
 		goto discard;
 #endif
 
-	if (sk->sk_state == TCP_ESTABLISHED) { /* Fast path */
-		sock_rps_save_rxhash(sk, skb);
+	if (sk->sk_state == TCP_ESTABLISHED) { /* Fast path */ 
+		sock_rps_save_rxhash(sk, skb->rxhash);
+		TCP_CHECK_TIMER(sk);
 		if (tcp_rcv_established(sk, skb, tcp_hdr(skb), skb->len)) {
 			rsk = sk;
 			goto reset;
 		}
+		TCP_CHECK_TIMER(sk);
 		return 0;
 	}
 
 	if (skb->len < tcp_hdrlen(skb) || tcp_checksum_complete(skb))
 		goto csum_err;
 
-	if (sk->sk_state == TCP_LISTEN) {
+	if (sk->sk_state == TCP_LISTEN) { //说明收到的是三次握手第一步SYN或者第三步ACK,这里是服务器端的情况
 		struct sock *nsk = tcp_v4_hnd_req(sk, skb);
 		if (!nsk)
 			goto discard;
 
-		if (nsk != sk) {
-			sock_rps_save_rxhash(nsk, skb);
-			if (tcp_child_process(sk, nsk, skb)) {
+		if (nsk != sk) {//如果是第一次握手的SYN，这里的nsk应该是'父'sk, 如果这里是三次握手的第三步ACK，则这里的nsk是‘子'sk
+			if (tcp_child_process(sk, nsk, skb)) { //这里面还是会调用tcp_rcv_state_process
 				rsk = nsk;
 				goto reset;
 			}
-			return 0;
-		}
+			return 0; //如果是握手的第三步，这里直接退出
+		} //如果是三次握手中的第一步SYN，则继续后面的操作
 	} else
-		sock_rps_save_rxhash(sk, skb);
+		sock_rps_save_rxhash(sk, skb->rxhash);
 
+    //走到这里说明只能是客户端收到SYN+ACK,或者是服务器端收到SYN
+	TCP_CHECK_TIMER(sk);
 	if (tcp_rcv_state_process(sk, skb, tcp_hdr(skb), skb->len)) {
 		rsk = sk;
 		goto reset;
 	}
+	TCP_CHECK_TIMER(sk);
 	return 0;
 
 reset:
@@ -1641,16 +2064,15 @@ csum_err:
 	TCP_INC_STATS_BH(sock_net(sk), TCP_MIB_INERRS);
 	goto discard;
 }
-EXPORT_SYMBOL(tcp_v4_do_rcv);
 
 /*
  *	From tcp_input.c
  */
-
+//tcp_protocol
 int tcp_v4_rcv(struct sk_buff *skb)
 {
 	const struct iphdr *iph;
-	const struct tcphdr *th;
+	struct tcphdr *th;
 	struct sock *sk;
 	int ret;
 	struct net *net = dev_net(skb->dev);
@@ -1685,7 +2107,7 @@ int tcp_v4_rcv(struct sk_buff *skb)
 				    skb->len - th->doff * 4);
 	TCP_SKB_CB(skb)->ack_seq = ntohl(th->ack_seq);
 	TCP_SKB_CB(skb)->when	 = 0;
-	TCP_SKB_CB(skb)->ip_dsfield = ipv4_get_dsfield(iph);
+	TCP_SKB_CB(skb)->flags	 = iph->tos;
 	TCP_SKB_CB(skb)->sacked	 = 0;
 
 	sk = __inet_lookup_skb(&tcp_hashinfo, skb, th->source, th->dest);
@@ -1791,49 +2213,72 @@ do_time_wait:
 	goto discard_it;
 }
 
-struct inet_peer *tcp_v4_get_peer(struct sock *sk, bool *release_it)
-{
-	struct rtable *rt = (struct rtable *) __sk_dst_get(sk);
-	struct inet_sock *inet = inet_sk(sk);
-	struct inet_peer *peer;
+/* VJ's idea. Save last timestamp seen from this destination
+ * and hold it at least for normal timewait interval to use for duplicate
+ * segment detection in subsequent connections, before they enter synchronized
+ * state.
+ */
 
-	if (!rt ||
-	    inet->cork.fl.u.ip4.daddr != inet->inet_daddr) {
-		peer = inet_getpeer_v4(inet->inet_daddr, 1);
-		*release_it = true;
+int tcp_v4_remember_stamp(struct sock *sk)
+{
+	struct inet_sock *inet = inet_sk(sk);
+	struct tcp_sock *tp = tcp_sk(sk);
+	struct rtable *rt = (struct rtable *)__sk_dst_get(sk);
+	struct inet_peer *peer = NULL;
+	int release_it = 0;
+
+	if (!rt || rt->rt_dst != inet->inet_daddr) {
+		peer = inet_getpeer(inet->inet_daddr, 1);
+		release_it = 1;
 	} else {
 		if (!rt->peer)
-			rt_bind_peer(rt, inet->inet_daddr, 1);
+			rt_bind_peer(rt, 1);
 		peer = rt->peer;
-		*release_it = false;
 	}
 
-	return peer;
-}
-EXPORT_SYMBOL(tcp_v4_get_peer);
+	if (peer) {
+		if ((s32)(peer->tcp_ts - tp->rx_opt.ts_recent) <= 0 ||
+		    ((u32)get_seconds() - peer->tcp_ts_stamp > TCP_PAWS_MSL &&
+		     peer->tcp_ts_stamp <= (u32)tp->rx_opt.ts_recent_stamp)) {
+			peer->tcp_ts_stamp = (u32)tp->rx_opt.ts_recent_stamp;
+			peer->tcp_ts = tp->rx_opt.ts_recent;
+		}
+		if (release_it)
+			inet_putpeer(peer);
+		return 1;
+	}
 
-void *tcp_v4_tw_get_peer(struct sock *sk)
+	return 0;
+}
+
+int tcp_v4_tw_remember_stamp(struct inet_timewait_sock *tw)
 {
-	const struct inet_timewait_sock *tw = inet_twsk(sk);
+	struct inet_peer *peer = inet_getpeer(tw->tw_daddr, 1);
 
-	return inet_getpeer_v4(tw->tw_daddr, 1);
+	if (peer) {
+		const struct tcp_timewait_sock *tcptw = tcp_twsk((struct sock *)tw);
+
+		if ((s32)(peer->tcp_ts - tcptw->tw_ts_recent) <= 0 ||
+		    ((u32)get_seconds() - peer->tcp_ts_stamp > TCP_PAWS_MSL &&
+		     peer->tcp_ts_stamp <= (u32)tcptw->tw_ts_recent_stamp)) {
+			peer->tcp_ts_stamp = (u32)tcptw->tw_ts_recent_stamp;
+			peer->tcp_ts	   = tcptw->tw_ts_recent;
+		}
+		inet_putpeer(peer);
+		return 1;
+	}
+
+	return 0;
 }
-EXPORT_SYMBOL(tcp_v4_tw_get_peer);
 
-static struct timewait_sock_ops tcp_timewait_sock_ops = {
-	.twsk_obj_size	= sizeof(struct tcp_timewait_sock),
-	.twsk_unique	= tcp_twsk_unique,
-	.twsk_destructor= tcp_twsk_destructor,
-	.twsk_getpeer	= tcp_v4_tw_get_peer,
-};
-
+//在tcp_prot->init中被赋值给inet_connection_sock->icsk_af_ops
 const struct inet_connection_sock_af_ops ipv4_specific = {
 	.queue_xmit	   = ip_queue_xmit,
 	.send_check	   = tcp_v4_send_check,
 	.rebuild_header	   = inet_sk_rebuild_header,
 	.conn_request	   = tcp_v4_conn_request,
 	.syn_recv_sock	   = tcp_v4_syn_recv_sock,
-	.get_peer	   = tcp_v4_get_peer,
+	.remember_stamp	   = tcp_v4_remember_stamp,
 	.net_header_len	   = sizeof(struct iphdr),
 	.setsockopt	   = ip_setsockopt,
 	.getsockopt	   = ip_getsockopt,
@@ -1845,7 +2290,6 @@ const struct inet_connection_sock_af_ops ipv4_specific = {
 	.compat_getsockopt = compat_ip_getsockopt,
 #endif
 };
-EXPORT_SYMBOL(ipv4_specific);
 
 #ifdef CONFIG_TCP_MD5SIG
 static const struct tcp_sock_af_ops tcp_sock_ipv4_specific = {
@@ -1858,6 +2302,7 @@ static const struct tcp_sock_af_ops tcp_sock_ipv4_specific = {
 
 /* NOTE: A lot of things set to zero explicitly by call to
  *       sk_alloc() so need not be done here.
+ 它主要是对tcp_sock和inet_connection_sock进行一些初始化；
  */
 static int tcp_v4_init_sock(struct sock *sk)
 {
@@ -1876,7 +2321,7 @@ static int tcp_v4_init_sock(struct sock *sk)
 	 * algorithms that we must have the following bandaid to talk
 	 * efficiently to them.  -DaveM
 	 */
-	tp->snd_cwnd = TCP_INIT_CWND;
+	tp->snd_cwnd = 2;
 
 	/* See draft-stevens-tcpca-spec-01 for discussion of the
 	 * initialization of these values.
@@ -1974,6 +2419,7 @@ void tcp_v4_destroy_sock(struct sock *sk)
 
 	percpu_counter_dec(&tcp_sockets_allocated);
 }
+
 EXPORT_SYMBOL(tcp_v4_destroy_sock);
 
 #ifdef CONFIG_PROC_FS
@@ -1991,11 +2437,6 @@ static inline struct inet_timewait_sock *tw_next(struct inet_timewait_sock *tw)
 		hlist_nulls_entry(tw->tw_node.next, typeof(*tw), tw_node) : NULL;
 }
 
-/*
- * Get next listener socket follow cur.  If cur is NULL, get first socket
- * starting from bucket given in st->bucket; when st->bucket is zero the
- * very first socket in the hash table is returned.
- */
 static void *listening_get_next(struct seq_file *seq, void *cur)
 {
 	struct inet_connection_sock *icsk;
@@ -2006,15 +2447,14 @@ static void *listening_get_next(struct seq_file *seq, void *cur)
 	struct net *net = seq_file_net(seq);
 
 	if (!sk) {
-		ilb = &tcp_hashinfo.listening_hash[st->bucket];
+		st->bucket = 0;
+		ilb = &tcp_hashinfo.listening_hash[0];
 		spin_lock_bh(&ilb->lock);
 		sk = sk_nulls_head(&ilb->head);
-		st->offset = 0;
 		goto get_sk;
 	}
 	ilb = &tcp_hashinfo.listening_hash[st->bucket];
 	++st->num;
-	++st->offset;
 
 	if (st->state == TCP_SEQ_STATE_OPENREQ) {
 		struct request_sock *req = cur;
@@ -2034,7 +2474,7 @@ static void *listening_get_next(struct seq_file *seq, void *cur)
 get_req:
 			req = icsk->icsk_accept_queue.listen_opt->syn_table[st->sbucket];
 		}
-		sk	  = sk_nulls_next(st->syn_wait_sk);
+		sk	  = sk_next(st->syn_wait_sk);
 		st->state = TCP_SEQ_STATE_LISTENING;
 		read_unlock_bh(&icsk->icsk_accept_queue.syn_wait_lock);
 	} else {
@@ -2043,13 +2483,11 @@ get_req:
 		if (reqsk_queue_len(&icsk->icsk_accept_queue))
 			goto start_req;
 		read_unlock_bh(&icsk->icsk_accept_queue.syn_wait_lock);
-		sk = sk_nulls_next(sk);
+		sk = sk_next(sk);
 	}
 get_sk:
 	sk_nulls_for_each_from(sk, node) {
-		if (!net_eq(sock_net(sk), net))
-			continue;
-		if (sk->sk_family == st->family) {
+		if (sk->sk_family == st->family && net_eq(sock_net(sk), net)) {
 			cur = sk;
 			goto out;
 		}
@@ -2066,7 +2504,6 @@ start_req:
 		read_unlock_bh(&icsk->icsk_accept_queue.syn_wait_lock);
 	}
 	spin_unlock_bh(&ilb->lock);
-	st->offset = 0;
 	if (++st->bucket < INET_LHTABLE_SIZE) {
 		ilb = &tcp_hashinfo.listening_hash[st->bucket];
 		spin_lock_bh(&ilb->lock);
@@ -2080,12 +2517,7 @@ out:
 
 static void *listening_get_idx(struct seq_file *seq, loff_t *pos)
 {
-	struct tcp_iter_state *st = seq->private;
-	void *rc;
-
-	st->bucket = 0;
-	st->offset = 0;
-	rc = listening_get_next(seq, NULL);
+	void *rc = listening_get_next(seq, NULL);
 
 	while (rc && *pos) {
 		rc = listening_get_next(seq, rc);
@@ -2100,18 +2532,13 @@ static inline int empty_bucket(struct tcp_iter_state *st)
 		hlist_nulls_empty(&tcp_hashinfo.ehash[st->bucket].twchain);
 }
 
-/*
- * Get first established socket starting from bucket given in st->bucket.
- * If st->bucket is zero, the very first socket in the hash is returned.
- */
 static void *established_get_first(struct seq_file *seq)
 {
 	struct tcp_iter_state *st = seq->private;
 	struct net *net = seq_file_net(seq);
 	void *rc = NULL;
 
-	st->offset = 0;
-	for (; st->bucket <= tcp_hashinfo.ehash_mask; ++st->bucket) {
+	for (st->bucket = 0; st->bucket <= tcp_hashinfo.ehash_mask; ++st->bucket) {
 		struct sock *sk;
 		struct hlist_nulls_node *node;
 		struct inet_timewait_sock *tw;
@@ -2156,7 +2583,6 @@ static void *established_get_next(struct seq_file *seq, void *cur)
 	struct net *net = seq_file_net(seq);
 
 	++st->num;
-	++st->offset;
 
 	if (st->state == TCP_SEQ_STATE_TIME_WAIT) {
 		tw = cur;
@@ -2173,7 +2599,6 @@ get_tw:
 		st->state = TCP_SEQ_STATE_ESTABLISHED;
 
 		/* Look for next non empty bucket */
-		st->offset = 0;
 		while (++st->bucket <= tcp_hashinfo.ehash_mask &&
 				empty_bucket(st))
 			;
@@ -2201,11 +2626,7 @@ out:
 
 static void *established_get_idx(struct seq_file *seq, loff_t pos)
 {
-	struct tcp_iter_state *st = seq->private;
-	void *rc;
-
-	st->bucket = 0;
-	rc = established_get_first(seq);
+	void *rc = established_get_first(seq);
 
 	while (rc && pos) {
 		rc = established_get_next(seq, rc);
@@ -2230,72 +2651,24 @@ static void *tcp_get_idx(struct seq_file *seq, loff_t pos)
 	return rc;
 }
 
-static void *tcp_seek_last_pos(struct seq_file *seq)
-{
-	struct tcp_iter_state *st = seq->private;
-	int offset = st->offset;
-	int orig_num = st->num;
-	void *rc = NULL;
-
-	switch (st->state) {
-	case TCP_SEQ_STATE_OPENREQ:
-	case TCP_SEQ_STATE_LISTENING:
-		if (st->bucket >= INET_LHTABLE_SIZE)
-			break;
-		st->state = TCP_SEQ_STATE_LISTENING;
-		rc = listening_get_next(seq, NULL);
-		while (offset-- && rc)
-			rc = listening_get_next(seq, rc);
-		if (rc)
-			break;
-		st->bucket = 0;
-		/* Fallthrough */
-	case TCP_SEQ_STATE_ESTABLISHED:
-	case TCP_SEQ_STATE_TIME_WAIT:
-		st->state = TCP_SEQ_STATE_ESTABLISHED;
-		if (st->bucket > tcp_hashinfo.ehash_mask)
-			break;
-		rc = established_get_first(seq);
-		while (offset-- && rc)
-			rc = established_get_next(seq, rc);
-	}
-
-	st->num = orig_num;
-
-	return rc;
-}
-
 static void *tcp_seq_start(struct seq_file *seq, loff_t *pos)
 {
 	struct tcp_iter_state *st = seq->private;
-	void *rc;
-
-	if (*pos && *pos == st->last_pos) {
-		rc = tcp_seek_last_pos(seq);
-		if (rc)
-			goto out;
-	}
-
 	st->state = TCP_SEQ_STATE_LISTENING;
 	st->num = 0;
-	st->bucket = 0;
-	st->offset = 0;
-	rc = *pos ? tcp_get_idx(seq, *pos - 1) : SEQ_START_TOKEN;
-
-out:
-	st->last_pos = *pos;
-	return rc;
+	return *pos ? tcp_get_idx(seq, *pos - 1) : SEQ_START_TOKEN;
 }
 
 static void *tcp_seq_next(struct seq_file *seq, void *v, loff_t *pos)
 {
-	struct tcp_iter_state *st = seq->private;
 	void *rc = NULL;
+	struct tcp_iter_state *st;
 
 	if (v == SEQ_START_TOKEN) {
 		rc = tcp_get_idx(seq, 0);
 		goto out;
 	}
+	st = seq->private;
 
 	switch (st->state) {
 	case TCP_SEQ_STATE_OPENREQ:
@@ -2303,8 +2676,6 @@ static void *tcp_seq_next(struct seq_file *seq, void *v, loff_t *pos)
 		rc = listening_get_next(seq, v);
 		if (!rc) {
 			st->state = TCP_SEQ_STATE_ESTABLISHED;
-			st->bucket = 0;
-			st->offset = 0;
 			rc	  = established_get_first(seq);
 		}
 		break;
@@ -2315,7 +2686,6 @@ static void *tcp_seq_next(struct seq_file *seq, void *v, loff_t *pos)
 	}
 out:
 	++*pos;
-	st->last_pos = *pos;
 	return rc;
 }
 
@@ -2341,7 +2711,7 @@ static void tcp_seq_stop(struct seq_file *seq, void *v)
 	}
 }
 
-int tcp_seq_open(struct inode *inode, struct file *file)
+static int tcp_seq_open(struct inode *inode, struct file *file)
 {
 	struct tcp_seq_afinfo *afinfo = PDE(inode)->data;
 	struct tcp_iter_state *s;
@@ -2354,42 +2724,43 @@ int tcp_seq_open(struct inode *inode, struct file *file)
 
 	s = ((struct seq_file *)file->private_data)->private;
 	s->family		= afinfo->family;
-	s->last_pos 		= 0;
 	return 0;
 }
-EXPORT_SYMBOL(tcp_seq_open);
 
 int tcp_proc_register(struct net *net, struct tcp_seq_afinfo *afinfo)
 {
 	int rc = 0;
 	struct proc_dir_entry *p;
 
+	afinfo->seq_fops.open		= tcp_seq_open;
+	afinfo->seq_fops.read		= seq_read;
+	afinfo->seq_fops.llseek		= seq_lseek;
+	afinfo->seq_fops.release	= seq_release_net;
+
 	afinfo->seq_ops.start		= tcp_seq_start;
 	afinfo->seq_ops.next		= tcp_seq_next;
 	afinfo->seq_ops.stop		= tcp_seq_stop;
 
 	p = proc_create_data(afinfo->name, S_IRUGO, net->proc_net,
-			     afinfo->seq_fops, afinfo);
+			     &afinfo->seq_fops, afinfo);
 	if (!p)
 		rc = -ENOMEM;
 	return rc;
 }
-EXPORT_SYMBOL(tcp_proc_register);
 
 void tcp_proc_unregister(struct net *net, struct tcp_seq_afinfo *afinfo)
 {
 	proc_net_remove(net, afinfo->name);
 }
-EXPORT_SYMBOL(tcp_proc_unregister);
 
-static void get_openreq4(const struct sock *sk, const struct request_sock *req,
+static void get_openreq4(struct sock *sk, struct request_sock *req,
 			 struct seq_file *f, int i, int uid, int *len)
 {
 	const struct inet_request_sock *ireq = inet_rsk(req);
 	int ttd = req->expires - jiffies;
 
 	seq_printf(f, "%4d: %08X:%04X %08X:%04X"
-		" %02X %08X:%08X %02X:%08lX %08X %5d %8d %u %d %pK%n",
+		" %02X %08X:%08X %02X:%08lX %08X %5d %8d %u %d %p%n",
 		i,
 		ireq->loc_addr,
 		ntohs(inet_sk(sk)->inet_sport),
@@ -2412,9 +2783,9 @@ static void get_tcp4_sock(struct sock *sk, struct seq_file *f, int i, int *len)
 {
 	int timer_active;
 	unsigned long timer_expires;
-	const struct tcp_sock *tp = tcp_sk(sk);
+	struct tcp_sock *tp = tcp_sk(sk);
 	const struct inet_connection_sock *icsk = inet_csk(sk);
-	const struct inet_sock *inet = inet_sk(sk);
+	struct inet_sock *inet = inet_sk(sk);
 	__be32 dest = inet->inet_daddr;
 	__be32 src = inet->inet_rcv_saddr;
 	__u16 destp = ntohs(inet->inet_dport);
@@ -2444,7 +2815,7 @@ static void get_tcp4_sock(struct sock *sk, struct seq_file *f, int i, int *len)
 		rx_queue = max_t(int, tp->rcv_nxt - tp->copied_seq, 0);
 
 	seq_printf(f, "%4d: %08X:%04X %08X:%04X %02X %08X:%08X %02X:%08lX "
-			"%08X %5d %8d %lu %d %pK %lu %lu %u %u %d%n",
+			"%08X %5d %8d %lu %d %p %lu %lu %u %u %d%n",
 		i, src, srcp, dest, destp, sk->sk_state,
 		tp->write_seq - tp->snd_una,
 		rx_queue,
@@ -2463,7 +2834,7 @@ static void get_tcp4_sock(struct sock *sk, struct seq_file *f, int i, int *len)
 		len);
 }
 
-static void get_timewait4_sock(const struct inet_timewait_sock *tw,
+static void get_timewait4_sock(struct inet_timewait_sock *tw,
 			       struct seq_file *f, int i, int *len)
 {
 	__be32 dest, src;
@@ -2479,7 +2850,7 @@ static void get_timewait4_sock(const struct inet_timewait_sock *tw,
 	srcp  = ntohs(tw->tw_sport);
 
 	seq_printf(f, "%4d: %08X:%04X %08X:%04X"
-		" %02X %08X:%08X %02X:%08lX %08X %5d %8d %d %d %pK%n",
+		" %02X %08X:%08X %02X:%08lX %08X %5d %8d %d %d %p%n",
 		i, src, srcp, dest, destp, tw->tw_substate, 0, 0,
 		3, jiffies_to_clock_t(ttd), 0, 0, 0, 0,
 		atomic_read(&tw->tw_refcnt), tw, len);
@@ -2518,18 +2889,12 @@ out:
 	return 0;
 }
 
-static const struct file_operations tcp_afinfo_seq_fops = {
-	.owner   = THIS_MODULE,
-	.open    = tcp_seq_open,
-	.read    = seq_read,
-	.llseek  = seq_lseek,
-	.release = seq_release_net
-};
-
 static struct tcp_seq_afinfo tcp4_seq_afinfo = {
 	.name		= "tcp",
 	.family		= AF_INET,
-	.seq_fops	= &tcp_afinfo_seq_fops,
+	.seq_fops	= {
+		.owner		= THIS_MODULE,
+	},
 	.seq_ops	= {
 		.show		= tcp4_seq_show,
 	},
@@ -2563,7 +2928,7 @@ void tcp4_proc_exit(void)
 
 struct sk_buff **tcp4_gro_receive(struct sk_buff **head, struct sk_buff *skb)
 {
-	const struct iphdr *iph = skb_gro_network_header(skb);
+	struct iphdr *iph = skb_gro_network_header(skb);
 
 	switch (skb->ip_summed) {
 	case CHECKSUM_COMPLETE:
@@ -2581,10 +2946,11 @@ struct sk_buff **tcp4_gro_receive(struct sk_buff **head, struct sk_buff *skb)
 
 	return tcp_gro_receive(head, skb);
 }
+EXPORT_SYMBOL(tcp4_gro_receive);
 
 int tcp4_gro_complete(struct sk_buff *skb)
 {
-	const struct iphdr *iph = ip_hdr(skb);
+	struct iphdr *iph = ip_hdr(skb);
 	struct tcphdr *th = tcp_hdr(skb);
 
 	th->check = ~tcp_v4_check(skb->len - skb_transport_offset(skb),
@@ -2593,25 +2959,26 @@ int tcp4_gro_complete(struct sk_buff *skb)
 
 	return tcp_gro_complete(skb);
 }
+EXPORT_SYMBOL(tcp4_gro_complete);
 
-struct proto tcp_prot = {
+//tcp层的发送封装函数为tcp_transmit_skb，该函数中封装了TCP首部(包括选项字段)，tcp层封装好后，走向ip层的接口ops为ipv4_specific
+//TCP协议传输层操作集，这个和应用层创建套接字相关，个人我理解是属于套接口层。TCP连接建立以及数据发送的ops函数在ipv4_specific
+struct proto tcp_prot = { //接收的时候由tcp_protocol里面的recv函数跳转到这里面             TCP的套接口层操作集在inetsw_array数组中的inet_stream_ops
 	.name			= "TCP",
 	.owner			= THIS_MODULE,
 	.close			= tcp_close,
-	.connect		= tcp_v4_connect,
+	.connect		= tcp_v4_connect,  
 	.disconnect		= tcp_disconnect,
 	.accept			= inet_csk_accept,
 	.ioctl			= tcp_ioctl,
-	.init			= tcp_v4_init_sock,
+	.init			= tcp_v4_init_sock,  //inet_create中执行
 	.destroy		= tcp_v4_destroy_sock,
 	.shutdown		= tcp_shutdown,
 	.setsockopt		= tcp_setsockopt,
 	.getsockopt		= tcp_getsockopt,
 	.recvmsg		= tcp_recvmsg,
-	.sendmsg		= tcp_sendmsg,
-	.sendpage		= tcp_sendpage,
 	.backlog_rcv		= tcp_v4_do_rcv,
-	.hash			= inet_hash,
+	.hash			= inet_hash,  //inet_create中执行  //将该传输控制块socket添加到tcp_hashinfo的对应hash中
 	.unhash			= inet_unhash,
 	.get_port		= inet_csk_get_port,
 	.enter_memory_pressure	= tcp_enter_memory_pressure,
@@ -2623,18 +2990,16 @@ struct proto tcp_prot = {
 	.sysctl_wmem		= sysctl_tcp_wmem,
 	.sysctl_rmem		= sysctl_tcp_rmem,
 	.max_header		= MAX_TCP_HEADER,
-	.obj_size		= sizeof(struct tcp_sock),
+	.obj_size		= sizeof(struct tcp_sock),  //inet_init中的rc = proto_register(&tcp_prot, 1);确定了缓存，在创建struct sock的时候的空间大小就是这个obj_size
 	.slab_flags		= SLAB_DESTROY_BY_RCU,
 	.twsk_prot		= &tcp_timewait_sock_ops,
 	.rsk_prot		= &tcp_request_sock_ops,
 	.h.hashinfo		= &tcp_hashinfo,
-	.no_autobind		= true,
 #ifdef CONFIG_COMPAT
 	.compat_setsockopt	= compat_tcp_setsockopt,
 	.compat_getsockopt	= compat_tcp_getsockopt,
 #endif
 };
-EXPORT_SYMBOL(tcp_prot);
 
 
 static int __net_init tcp_sk_init(struct net *net)
@@ -2665,3 +3030,20 @@ void __init tcp_v4_init(void)
 	if (register_pernet_subsys(&tcp_sk_ops))
 		panic("Failed to create the TCP control socket.\n");
 }
+
+EXPORT_SYMBOL(ipv4_specific);
+EXPORT_SYMBOL(tcp_hashinfo);
+EXPORT_SYMBOL(tcp_prot);
+EXPORT_SYMBOL(tcp_v4_conn_request);
+EXPORT_SYMBOL(tcp_v4_connect);
+EXPORT_SYMBOL(tcp_v4_do_rcv);
+EXPORT_SYMBOL(tcp_v4_remember_stamp);
+EXPORT_SYMBOL(tcp_v4_send_check);
+EXPORT_SYMBOL(tcp_v4_syn_recv_sock);
+
+#ifdef CONFIG_PROC_FS
+EXPORT_SYMBOL(tcp_proc_register);
+EXPORT_SYMBOL(tcp_proc_unregister);
+#endif
+EXPORT_SYMBOL(sysctl_tcp_low_latency);
+

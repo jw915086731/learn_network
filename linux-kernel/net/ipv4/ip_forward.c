@@ -51,6 +51,11 @@ static int ip_forward_finish(struct sk_buff *skb)
 	return dst_output(skb);
 }
 
+//在函数ip_route_input_slow->ip_mkroute_input注册，
+/*
+ * IP数据包的转发是由ip_forward()处理，该函数在ip_rcv_finish()
+ * 通过输入路由缓存被调用。
+ */
 int ip_forward(struct sk_buff *skb)
 {
 	struct iphdr *iph;	/* Our header */
@@ -84,19 +89,19 @@ int ip_forward(struct sk_buff *skb)
 
 	rt = skb_rtable(skb);
 
-	if (opt->is_strictroute && opt->nexthop != rt->rt_gateway)
+	if (opt->is_strictroute && rt->rt_dst != rt->rt_gateway)
 		goto sr_failed;
 
-	if (unlikely(skb->len > dst_mtu(&rt->dst) && !skb_is_gso(skb) &&
+	if (unlikely(skb->len > dst_mtu(&rt->u.dst) && !skb_is_gso(skb) &&
 		     (ip_hdr(skb)->frag_off & htons(IP_DF))) && !skb->local_df) {
-		IP_INC_STATS(dev_net(rt->dst.dev), IPSTATS_MIB_FRAGFAILS);
+		IP_INC_STATS(dev_net(rt->u.dst.dev), IPSTATS_MIB_FRAGFAILS);
 		icmp_send(skb, ICMP_DEST_UNREACH, ICMP_FRAG_NEEDED,
-			  htonl(dst_mtu(&rt->dst)));
+			  htonl(dst_mtu(&rt->u.dst)));
 		goto drop;
 	}
 
 	/* We are about to mangle packet. Copy it! */
-	if (skb_cow(skb, LL_RESERVED_SPACE(rt->dst.dev)+rt->dst.header_len))
+	if (skb_cow(skb, LL_RESERVED_SPACE(rt->u.dst.dev)+rt->u.dst.header_len))
 		goto drop;
 	iph = ip_hdr(skb);
 
@@ -113,7 +118,7 @@ int ip_forward(struct sk_buff *skb)
 	skb->priority = rt_tos2priority(iph->tos);
 
 	return NF_HOOK(NFPROTO_IPV4, NF_INET_FORWARD, skb, skb->dev,
-		       rt->dst.dev, ip_forward_finish);
+		       rt->u.dst.dev, ip_forward_finish);
 
 sr_failed:
 	/*

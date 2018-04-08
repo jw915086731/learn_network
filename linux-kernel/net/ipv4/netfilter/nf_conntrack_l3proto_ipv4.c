@@ -6,6 +6,7 @@
  * it under the terms of the GNU General Public License version 2 as
  * published by the Free Software Foundation.
  */
+//ipv4连接跟踪模块
 
 #include <linux/types.h>
 #include <linux/ip.h>
@@ -34,6 +35,7 @@ int (*nf_nat_seq_adjust_hook)(struct sk_buff *skb,
 			      enum ip_conntrack_info ctinfo);
 EXPORT_SYMBOL_GPL(nf_nat_seq_adjust_hook);
 
+//获取报文中的源IP目的IP
 static bool ipv4_pkt_to_tuple(const struct sk_buff *skb, unsigned int nhoff,
 			      struct nf_conntrack_tuple *tuple)
 {
@@ -87,6 +89,15 @@ static int ipv4_get_l4proto(const struct sk_buff *skb, unsigned int nhoff,
 	return NF_ACCEPT;
 }
 
+
+/*
+对于一个新链接，在ipv4_conntrack_in()函数中只是创建了struct nf_conn结构，但并没有将该结构挂载到链接跟踪的Hash表中，因为此时还
+不能确定该链接是否会被NF_IP_FORWARD点上的钩子函数过滤掉，所以将挂载到Hash表的工作放到了ipv4_confirm()函数中。
+子链接的helper功能也是在该函数中实现的。
+*/
+/*
+ipv4_confirm()函数主要负责确认链接(即将链接挂入到正式的链接表中)、执行helper函数、启动链接超时定时器等
+*/
 static unsigned int ipv4_confirm(unsigned int hooknum,
 				 struct sk_buff *skb,
 				 const struct net_device *in,
@@ -101,7 +112,7 @@ static unsigned int ipv4_confirm(unsigned int hooknum,
 
 	/* This is where we call the helper: as the packet goes out. */
 	ct = nf_ct_get(skb, &ctinfo);
-	if (!ct || ctinfo == IP_CT_RELATED_REPLY)
+	if (!ct || ctinfo == IP_CT_RELATED + IP_CT_IS_REPLY)
 		goto out;
 
 	help = nfct_help(ct);
@@ -121,9 +132,7 @@ static unsigned int ipv4_confirm(unsigned int hooknum,
 		return ret;
 	}
 
-	/* adjust seqs for loopback traffic only in outgoing direction */
-	if (test_bit(IPS_SEQ_ADJUST_BIT, &ct->status) &&
-	    !nf_is_loopback_packet(skb)) {
+	if (test_bit(IPS_SEQ_ADJUST_BIT, &ct->status)) {
 		typeof(nf_nat_seq_adjust_hook) seq_adjust;
 
 		seq_adjust = rcu_dereference(nf_nat_seq_adjust_hook);
@@ -146,6 +155,9 @@ static unsigned int ipv4_conntrack_in(unsigned int hooknum,
 	return nf_conntrack_in(dev_net(in), PF_INET, hooknum, skb);
 }
 
+/*
+ipv4_conntrack_local() 挂载在NF_IP_LOCAL_OUT点上。该函数功能与ipv4_conntrack_in()函数基本相同，但其用来处理本机主动向外发起的链接。
+*/
 static unsigned int ipv4_conntrack_local(unsigned int hooknum,
 					 struct sk_buff *skb,
 					 const struct net_device *in,
@@ -300,6 +312,7 @@ getorigdst(struct sock *sk, int optval, void __user *user, int *len)
 #include <linux/netfilter/nfnetlink.h>
 #include <linux/netfilter/nfnetlink_conntrack.h>
 
+//拷贝L3中的源和目的IP到SKB对应的地方
 static int ipv4_tuple_to_nlattr(struct sk_buff *skb,
 				const struct nf_conntrack_tuple *tuple)
 {
@@ -342,7 +355,8 @@ static struct nf_sockopt_ops so_getorigdst = {
 	.owner		= THIS_MODULE,
 };
 
-struct nf_conntrack_l3proto nf_conntrack_l3proto_ipv4 __read_mostly = {
+//struct nf_conntrack_l3proto nf_conntrack_l3proto_ipv4 __read_mostly = {
+struct nf_conntrack_l3proto nf_conntrack_l3proto_ipv4 = {
 	.l3proto	 = PF_INET,
 	.name		 = "ipv4",
 	.pkt_to_tuple	 = ipv4_pkt_to_tuple,

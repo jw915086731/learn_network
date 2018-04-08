@@ -177,7 +177,8 @@ static struct ctl_table udp_compat_sysctl_table[] = {
 #endif /* CONFIG_NF_CONNTRACK_PROC_COMPAT */
 #endif /* CONFIG_SYSCTL */
 
-struct nf_conntrack_l4proto nf_conntrack_l4proto_udp4 __read_mostly =
+//struct nf_conntrack_l4proto nf_conntrack_l4proto_udp4 __read_mostly =
+struct nf_conntrack_l4proto nf_conntrack_l4proto_udp4 =
 {
 	.l3proto		= PF_INET,
 	.l4proto		= IPPROTO_UDP,
